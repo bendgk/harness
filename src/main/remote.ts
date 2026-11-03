@@ -49,9 +49,11 @@ export interface RemoteTags {
   native?: string
   cwd?: string
   title?: string
+  /** Agent callsign (names.ts), so another Paper adopting the session keeps it. */
+  name?: string
 }
 
-const TAG_KEYS = ['id', 'provider', 'native', 'cwd', 'title'] as const
+const TAG_KEYS = ['id', 'provider', 'native', 'cwd', 'title', 'name'] as const
 
 /** Tag values are one line; tmux would keep a newline, the inventory parser would not. */
 function tagValue(v: string): string {

@@ -42,7 +42,8 @@ src/main/sessions.ts     SessionManager over node-pty. The session Map is a kern
                          pty listeners across generations. Remote sessions: launch, link supervision, adopt.
 src/main/remote.ts       tmux-on-a-machine commands (launch, has/kill-session, @paper_* tags, rollout discovery).
 src/main/ipc.ts          IPC handlers (returns a disposer), event wiring, the usage/handoff/title services.
-src/main/providers/      claude, codex, shell: argv/env planning, transcript parsing, transplant for handoff.
+src/main/providers/      claude, codex, shell: argv/env planning, transcript parsing (incremental fold, see
+                         transcript.ts; activity.ts distils what the agent is doing), transplant for handoff.
 src/main/accounts.ts     Isolated CLI homes under ~/.paper/accounts/<id>; keychain import; identity display.
 src/main/handoff.ts      Account switch, directory retarget and machine handoff with the conversation intact.
 src/main/usage.ts        Transcript polling → UsageSnapshot (tracks in a kernel slot); mirrors remote transcripts.
@@ -54,7 +55,10 @@ src/main/machines.ts     Machine registry (the allowlist), probe, ensureReady, ~
                          agent system-prompt text, machine_exec, and the tmux inventory poller.
 src/main/persist.ts      ~/.paper/sessions.json session registry + shell scrollback; restore-on-boot, orphan reaping.
 src/main/menu.ts         Application menu = the single source of shortcuts; sends `app:command` to the renderer.
-src/main/mcp.ts          MCP server (Streamable HTTP, stateless) over the tool registry.
+src/main/mcp.ts          MCP server (Streamable HTTP, stateless) over the tool registry; GET /agents/brief.
+src/main/names.ts        Agent callsigns: the name pool, validation, pickName. See *Agent callsigns & awareness*.
+src/main/agents.ts       agents_list / agent_info / agent_transcript / the @mention brief, from memory.
+src/main/hooks.ts        The Claude UserPromptSubmit @mention hook (script + --settings JSON, local and remote).
 src/main/tools/          THE TOOL REGISTRY. types.ts (contract), app/sessions/ui/dev/state/machines.ts (tools),
                          index.ts (list), runtime.ts (validate+invoke), context.ts (binds live services).
 src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage,handoff,machines,tools,on*}.
@@ -67,7 +71,7 @@ scripts/sync-tools.mjs   Regenerates the Tools section of this file from the reg
 
 Runtime data: `~/.paper/` (`state.json`, `sessions.json`, `scrollback/<id>.log`, `accounts/<id>/`, `logs/`,
 `mcp.json`, `shots/`, `ssh/` control sockets, `gateway-tokens.json`, `run/` scratch, `remote/<alias>/` transcript
-mirrors). Override with `PAPER_HOME`.
+mirrors, `hooks/paper-mention.sh`). Override with `PAPER_HOME`.
 
 ### The kernel / hot-bundle split
 
@@ -146,8 +150,9 @@ Sessions survive Paper restarts. `src/main/persist.ts` keeps `~/.paper/sessions.
 
 The intended loop: run `npm run dev` once, open a Claude Code session in this repo inside that Paper, and edit.
 Renderer and main-process changes land live in the very window you are sitting in; the session doing the editing
-is unaffected because it is a kernel slot, not app-bundle state. Claude sessions spawned by Paper get
-`--mcp-config ~/.paper/mcp.json` automatically, so the `paper` tools are already in your tool list.
+is unaffected because it is a kernel slot, not app-bundle state. Claude sessions spawned by Paper get Paper's MCP
+server automatically (`--mcp-config` with inline JSON naming the endpoint and an `X-Paper-Session: <id>` header;
+local Codex gets `-c mcp_servers.paper.url=…` + `http_headers`), so the `paper` tools are already in your tool list.
 
 Two cautions:
 
@@ -164,8 +169,13 @@ Two cautions:
 - Transport: Streamable HTTP, stateless, JSON responses. Bound to loopback only; no auth (anything on your machine
   can already type into your terminals). Do not expose it beyond localhost.
 - Connect: this repo's `.mcp.json` (for agents working on Paper from any terminal), `claude --mcp-config
-  ~/.paper/mcp.json` (written at startup; Paper adds it to its own Claude sessions), or `PAPER_MCP_URL` in any
-  session's environment. `PAPER_MCP=0` in Paper's environment disables the auto-attach.
+  ~/.paper/mcp.json` (written at startup), or `PAPER_MCP_URL` in any session's environment. Paper's own agents get
+  the endpoint inline plus `X-Paper-Session: <their session id>` (an identifier, not a credential), which is how
+  `agents_list` marks the caller's row `self`. `PAPER_MCP=0` in Paper's environment disables the auto-attach (and the
+  @mention hook).
+- Besides `/mcp`, `GET /agents/brief?names=a,b&from=<session>` serves the @mention brief as plain text (the kernel
+  forwards every path but `/health` to the app's `handleHttp`; `mcp.ts` routes it). It answers only when the `Host`
+  header is loopback, so a DNS-rebound web page cannot read other agents' activity.
 - Tool list caching: MCP clients fetch tools at connect time. A tool you add during a session is served immediately
   but your client will not list it until it reconnects (`/mcp` in Claude Code). Until then use
   `tools_list` + `tools_invoke`, which always see the live registry.
@@ -222,7 +232,9 @@ login-shell PATH), not `not-logged-in`. Throws `MachineFailure` (`.info` is the 
 
 **Inventory** (`inventory()`, `startInventory()` from `wireEvents`): the remote is the source of truth for which
 agents exist. Per machine, one ssh reads `tmux -L paper list-sessions` (private socket; names `paper-*`; user
-options `@paper_id/@paper_provider/@paper_native/@paper_cwd/@paper_title`); "no server running" is an empty list.
+options `@paper_id/@paper_provider/@paper_native/@paper_cwd/@paper_name/@paper_title` — the title last, since it is
+free text); "no server running" is an empty list. `cachedInventories()` is the last poll from memory (no ssh), used by
+`agents_list` and callsign uniqueness.
 `attached` = a live local session has `host === alias && remote.tmux === name` and its link is not `lost`. Polls
 every 10 s while a Paper window is focused, 60 s otherwise, immediately on start, on window focus, on registry
 change, and on `machineEvents.emit('poke', alias)` — **poke after any remote launch/close/handoff**. Machines whose
@@ -230,11 +242,14 @@ probe failed with `auth`/`host-key` are not polled (their error is still reporte
 failure during a poll is written to the probe for the same reason. `inventory({ refresh: true })` re-probes those
 first. Results go out as `machineEvents 'inventory'` → IPC `machines:inventory`.
 
-**Agent context** (`machineContextPrompt({ sessionId, host })`, '' when there is nothing to say): a short block
-appended to agents' system prompts — where the agent runs, the registered machines (alias, user@hostname, OS, CLIs,
-default cwd, note, probe status), how to use them (`ssh <alias> -- '<cmd>'` non-interactively, `scp`/`rsync -az`,
-long jobs under `tmux new -d` / `nohup`), never to fix ssh or install anything, and to call `session_handoff` with
-`id = $PAPER_SESSION` and `host` when asked to move. It is in every prompt: keep it short.
+**Agent context** (`machineContextPrompt({ sessionId, host, name, agentTools })`, '' only for an unnamed local
+session with no machines): a short block appended to agents' system prompts — where the agent runs, the registered
+machines (alias, user@hostname, OS, CLIs, default cwd, note, probe status), how to use them (`ssh <alias> -- '<cmd>'`
+non-interactively, `scp`/`rsync -az`, long jobs under `tmux new -d` / `nohup`), never to fix ssh or install anything,
+and to call `session_handoff` with `id = $PAPER_SESSION` and `host` when asked to move. Every named agent also gets
+`# Agents (from Paper)`: its own callsign ("You are @euclid in Paper"), that `@name` means another Paper agent, that a
+brief may already be attached, and which tools to use (or that it has none: `agentTools` false). It is in every
+prompt: keep it short. The prompt is fixed at launch, so a renamed agent learns its new name on its next start.
 
 **Gateway** (`src/main/gateway.ts`) — how agents running *on* a machine call Paper tools (e.g. hand themselves back):
 - A second HTTP listener, `127.0.0.1:<gatewayPort>` (persisted in `state.json`), separate from the open local MCP
@@ -244,7 +259,8 @@ long jobs under `tmux new -d` / `nohup`), never to fix ssh or install anything, 
   remote session, bound to `{sessionId, host}`. Only sha256 hashes are stored (`~/.paper/gateway-tokens.json`, 0600,
   atomic); comparison is constant-time over all records. The token exists only in the remote agent's MCP config,
   uploaded 0600 (dir 0700) to `~/.paper/run/<sessionId>.json` by `provisionRemoteSession` — which returns the absolute
-  path for `claude --mcp-config`. **Provisioning is idempotent**: a running agent read its config once, at launch,
+  path for `claude --mcp-config`. It also uploads the @mention hook script to `~/.paper/run/paper-mention.sh` (0700,
+  once per Paper process and alias; `hook: false` in the result if that failed — the agent then starts without it). **Provisioning is idempotent**: a running agent read its config once, at launch,
   and holds the token in memory, so if a hash for (sessionId, alias) is on file and the remote config still exists
   (`[ -f ]`), nothing is rewritten and the same token keeps working — call it freely on restore. Otherwise (no hash,
   file gone, session now on another alias, or tokens revoked by a port rotation) a fresh token is uploaded and the
@@ -255,7 +271,18 @@ long jobs under `tmux new -d` / `nohup`), never to fix ssh or install anything, 
 - Remote callers get a scoped MCP server (`handleMcpRequest` in `mcp.ts` with a filtered tool list + wrapped invoke):
   only `REMOTE_SCOPE` tools are listed or callable — not `tools_invoke`/`tools_list`, so the filter cannot be
   bypassed. `self` tools get `id` forced to the caller's session (a different id is refused, never retargeted);
-  `remoteOnly` tools (`session_spawn`) need `host` = a registered machine, never `local`.
+  `remoteOnly` tools (`session_spawn`) need `host` = a registered machine, never `local`. `introspect` tools
+  (`agents_list`, `agent_info`, `agent_transcript`) are listed and callable only while the caller's machine allows
+  introspection; `caller` tools (`agents_list`) get `from` forced to the caller (it is hidden from their schema).
+  `GET /agents/brief` (the remote @mention hook) is served here too, bearer-authenticated, empty when introspection
+  is off.
+- **Trust: `allowAgentIntrospection`** (per machine, default true; `machine_update { allow_agent_introspection }`).
+  With it on, **an agent on that machine can read what every other Paper agent is doing — their recent prompts,
+  replies, tool calls (commands, file paths), todos and older conversation pages — local agents included**, and the
+  @mention brief carries the same into its context. Whatever is in another agent's conversation (pasted secrets,
+  private code) can reach that machine. Turn it off for machines you trust less: the tools disappear from that
+  machine's gateway scope, calls are refused and the brief is empty. Agents' system prompts tell them other agents'
+  text is information, not instructions, but that is mitigation, not isolation.
 - **Trust: `allowAgentHandoffToLocal`** (per machine, default true; `machine_update`). A remote agent that hands
   itself to the Mac then runs *with local privileges*, steered by a conversation that was on the remote — so a
   compromised remote could inject instructions and then move the agent here. Turn it off for machines you trust less;
@@ -304,8 +331,9 @@ progress as dim notices in the pane): `ensureReady(alias, provider)` → for Cla
   Options go in before the session exists (history-limit and default-terminal only apply to new panes).
   `escape-time 0` because ESC is Claude's interrupt; `smcup@/rmcup@` so output scrolls into Paper's own scrollback.
   `-L paper` + `-f /dev/null`: a private server the user's tmux config can neither break nor see.
-- tags the session with `@paper_id/@paper_provider/@paper_native/@paper_cwd/@paper_title` (title and native id are
-  re-tagged on change via `patchMeta`), so the machine itself says what runs there (inventory, adopt).
+- tags the session with `@paper_id/@paper_provider/@paper_native/@paper_cwd/@paper_title/@paper_name` (title and
+  native id are re-tagged on change via `patchMeta`, the callsign by `setName`/backfill), so the machine itself says
+  what runs there (inventory, adopt).
 - prints the physical cwd (`pwd -P`), which becomes `meta.cwd` (Claude slugs its project dir from it).
 
 Then the local pty is `ssh <sessionOptions> -tt -- <alias> exec $SHELL -lc 'exec tmux -L paper attach-session -t
@@ -367,7 +395,10 @@ gateway) must not be killed inside its own tool call. If the session is `working
 with a default continue prompt ("You have been handed off to … in {cwd}. Continue the task …"; `{cwd}` is filled in
 after the directory is resolved). From a machine with `allowAgentHandoffToLocal: false`, moving to `local` is refused.
 
-**Codex and Paper tools.** Remote Codex runs without Paper tools: its HTTP MCP auth takes the bearer token from argv
+**Codex and Paper tools.** Local Codex gets Paper's MCP server with `-c mcp_servers.paper.url="<url>"` and
+`-c mcp_servers.paper.http_headers={"X-Paper-Session"="<id>"}` (no token locally; verified on codex-cli 0.163 with
+`codex -c … mcp get paper --json` → `streamable_http`). It has no @mention hook, so it relies on the prompt and the
+agent tools. Remote Codex runs without Paper tools: its HTTP MCP auth takes the bearer token from argv
 (`-c …http_headers`) or an env var (`bearer_token_env_var`/`env_http_headers`), and the token must be in neither;
 `http_headers_helper` exists in codex 0.163 but not in 0.144 (g6e). Codex *does* get the machine context, via
 `-c developer_instructions=<JSON string>` (verified on 0.144 and 0.163; a JSON string is a valid TOML basic string).
@@ -377,11 +408,82 @@ after the directory is resolved). From a machine with `allowAgentHandoffToLocal:
 `PAPER_HOME`/ports and `SSH_AUTH_SOCK` in its env, drive it over MCP, and clean up `tmux -L paper` sessions,
 `~/.paper/run/*` and uploaded transcripts on the machine afterwards.
 
+## Agent callsigns & awareness
+
+Every **root agent** session (Claude Code / Codex; never shells, never subagents — those live inside the CLI
+process and are not Paper sessions) has a short callsign on `SessionMeta.name` (`euclid`, `hermes`, `leonardo`),
+so the user can write "what is @leonardo doing?" in any agent and that agent finds out — on this Mac or any machine.
+
+**Names** (`src/main/names.ts`: `NAME_POOL`, `isValidAgentName` = `/^[a-z][a-z0-9]{1,15}$/` and not `local`,
+`normaliseAgentName`, `pickName(taken)`; the session side is in `sessions.ts`):
+- `spawn()` names every agent: `req.name` if valid and free, else `pickName`. `takenNames(self)` = other live
+  agents' names + machine aliases (lowercased) + agents seen in machines' inventories (`@paper_name`; the session's
+  own tmux session excluded) + `local` + names `persist.ts` reserved during restore.
+- **Backfill**: `adopt()` names agents from a generation that predates callsigns (a hot swap; remote ones are
+  re-tagged); `insert()` names restored records that have none (restore reserves every record's name first, so a
+  backfill never takes a later record's) and replaces a name that now clashes; `adoptRemote` keeps the `@paper_name`
+  tag when it is free.
+- Names are on meta, so they follow account/directory/machine handoff, ⌘R and Paper restarts (sessions.json).
+- **Rename**: IPC `session:setName` / tool `agent_rename` → `setName`: validated, unique against agents and machine
+  aliases, emits `session:update`, re-tags a remote's `@paper_name` and pokes the inventory once the tag is written.
+  Errors are human-readable ("@g6e is a machine; …", "@x is already another agent's callsign.").
+- **Machine collision**: `addMachine` registering an alias equal to a live agent's name renames the *agent*
+  (`yieldNameTo`) with a pane notice "renamed @x → @y: @x is now a machine" — machines come from `~/.ssh/config`,
+  which the user changes less easily.
+- Remote launches tag `@paper_name`; `parseInventory` reads it into `HostedAgent.name`.
+
+**Activity index** (`providers/activity.ts`, `providers/transcript.ts`, `usage.ts`). The UsageTracker already
+tailed each transcript for usage; it now reads **incrementally**: a `Cursor` per session (kernel slot
+`usage.cursors`: path, inode, byte offset, the partial last line as `carry`, and the provider's folded
+`TranscriptState`) and only bytes past the offset are read and folded (`provider.fold(state, record)`; split on
+0x0A, which is UTF-8 safe). A shrunk/replaced/other file or a changed `state.v` (bump the provider's
+`STATE_VERSION` whenever the state or `Activity` shape changes) restarts from 0. Reads are capped at 48 MB per tick
+across sessions, so a 200 MB first read takes a few ticks instead of freezing main; usage is emitted once caught up.
+The same pass keeps, per session, `Activity`: `lastPrompt` (real user words only — not tool results, `isMeta`,
+command wrappers, `<bash-stdout>`, or Paper's own restart/handoff prompts, which are kept as `paper` turns),
+`lastReply`, `lastTool` (`Bash: npm test`, `Edit src/x.ts`, `mcp paper.agents_list`), todos (Claude `TodoWrite`
+and `TaskCreate`/`TaskUpdate`, Codex `update_plan`), recently edited files, cwd/branch, `lastActiveAt`, and a ring
+of the last 240 condensed turns with stable `seq` numbers. Claude sidechain (subagent) records are skipped. Remote
+agents' transcripts are mirrored locally while attached, so they are indexed the same way.
+
+**Tools** (group *Agents* below; `src/main/agents.ts`): `agents_list` is pure memory, O(sessions) (≈1 ms round
+trip over MCP): live named agents + detached agents from the cached inventory (tmux tags only; `sessionId` = the
+tag's `@paper_id`). `agent_info` renders the summary, the last N exchanges (tool runs folded), todos and files,
+capped at `max_chars`; for a **detached** agent it fetches the transcript's last 512 KB (`downloadTail`, first
+partial line dropped, cached 15 s). `agent_transcript` pages by `seq`; past the ring it re-parses the whole local
+(or mirrored) file once, cached while unchanged. Lookup is case-insensitive, `@` optional, and accepts a session id
+or a unique ≥8-char prefix; an unknown name errors with the list of known ones. IPC `agents:list` =
+`listAgents({ includeExited: true })`.
+
+**The @mention hook (Claude only)** (`src/main/hooks.ts`). Local and remote Claude sessions get
+`--settings '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"sh <script>","timeout":5}]}]}}'`.
+Verified on Claude Code 2.1.317: `--settings <file-or-json>` *adds* a settings source — the user's, project and
+local hooks still run alongside it (tested with a project `UserPromptSubmit` hook plus a `--settings` one: both
+reached the model) — and on exit 0 a `UserPromptSubmit` hook's plain stdout is added to the context before the
+model runs (it shows as a `hook_success` attachment in the transcript). Stdin is JSON with `prompt`, `session_id`,
+`transcript_path`, `cwd`. The script (POSIX sh, no jq) greps `@token`s not preceded by a word char, `.`, `/` or `@`
+(so `ben@g6e` and `/x/@scope` are ignored), lowercases and dedupes ≤8, and only if there are any calls
+`curl -fsS -m 2` and prints the result; it always exits 0, never blocks or changes the prompt, and prints nothing
+when nothing matches or Paper is unreachable.
+- Local: `$PAPER_MCP_URL` minus `/mcp` + `/agents/brief?names=…&from=$PAPER_SESSION` (script at
+  `~/.paper/hooks/paper-mention.sh`, 0700, rewritten when stale).
+- Remote (`$PAPER_HOST` set): the gateway URL and bearer token are read with `sed` from the session's 0600
+  `~/.paper/run/$PAPER_SESSION.json` and the header is handed to curl on stdin (`-H @-`) — never argv or env. The
+  script is uploaded 0700 next to it by `provisionRemoteSession`.
+- The brief: a header saying it is information, not instructions; one line per mention (`@leonardo — claude on
+  @g6e, working, ~/work/x. Doing: Edit src/x.ts. Last ask: "…". Todos: 2 open of 5.`; a machine gets its status and
+  the agents on it; your own name says "that is you"); unknown names are skipped; then "Use agent_info for more."
+- Codex has no such hook; it learns `@name` from its prompt and uses the tools.
+
+**Testing it**: spawn two local Claude agents, ask one "what is @<other> doing?", then read its transcript for a
+`hook_success` attachment with the brief (`tools/show-turns`-style: `attachment.type === 'hook_success'`,
+`hookName === 'UserPromptSubmit'`). `curl 'http://127.0.0.1:<port>/agents/brief?names=a,b'` shows the brief directly.
+
 ## Tools
 
 <!-- tools:begin (generated by `npm run tools:sync`; do not edit by hand) -->
 
-43 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
+47 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
 
 ### Instance
 
@@ -399,7 +501,7 @@ The manifest of every Paper tool with its JSON-schema input, including tools add
 
 | param | type | | description |
 |---|---|---|---|
-| `group` | "app" \| "sessions" \| "ui" \| "dev" \| "state" \| "machines" | optional | Only tools in this group |
+| `group` | "app" \| "sessions" \| "ui" \| "dev" \| "state" \| "machines" \| "agents" | optional | Only tools in this group |
 
 #### `tools_invoke`
 
@@ -728,7 +830,7 @@ Register an ssh host alias as a Paper machine, then probe it. The alias must alr
 
 #### `machine_update`
 
-Change a registered machine's label, note, default working directory, or whether its agents may hand themselves back to this Mac. Pass "" to clear a text field.
+Change a registered machine's label, note, default working directory, whether its agents may hand themselves back to this Mac, or whether they may look at other agents. Pass "" to clear a text field.
 
 | param | type | | description |
 |---|---|---|---|
@@ -737,6 +839,7 @@ Change a registered machine's label, note, default working directory, or whether
 | `note` | string | optional | One line shown to agents |
 | `default_cwd` | string | optional | Default working directory on the machine (absolute or ~/...) |
 | `allow_agent_handoff_to_local` | boolean | optional | Whether agents running on this machine may move themselves back to this Mac through the gateway (default true) |
+| `allow_agent_introspection` | boolean | optional | Whether agents running on this machine may list the other Paper agents and read what they are doing, including their recent conversation, through the gateway (agents_list/agent_info/agent_transcript and the @mention brief; default true) |
 
 #### `machine_remove`
 
@@ -781,6 +884,49 @@ What is actually running on each registered machine, read from the machine itsel
 The remote-agent gateway: the loopback port remote agents reach Paper on (through per-machine reverse ssh tunnels), each tunnel's state (down/connecting/up/failed, with a classified error) and remote port, and how many session tokens are live.
 
 _No parameters._
+
+### Agents
+
+Agent callsigns (@name) and what each agent is doing, across this Mac and every machine.
+
+#### `agents_list` · read-only
+
+Every named Paper agent (Claude Code / Codex root sessions; subagents and shells are not listed), on this Mac and on every machine, attached or detached: callsign, host, provider, status, cwd, title, what it is doing now, its last ask/reply, last tool call and open todos. Pure memory and cheap — call it whenever "@name" comes up. Your own row has `self: true`. Use agent_info for one agent in depth.
+
+| param | type | | description |
+|---|---|---|---|
+| `host` | string | optional | Only agents running here: "local" or a machine alias |
+| `include_exited` | boolean | default `false` | Also list agents whose process has exited |
+| `from` | string | optional | Your own session id ($PAPER_SESSION) to mark your row; Paper fills it in for its agents |
+
+#### `agent_info` · read-only
+
+One agent in depth: status, host, cwd and branch, what it is doing, its last ask and reply, its todo list, files it edited, and its recent exchanges condensed (user asks, agent replies, tool calls as one-liners), oldest first. Works for agents on machines too (a detached one is read from the tail of its transcript there). Output is capped at `max_chars`; agent_transcript pages further back.
+
+| param | type | | description |
+|---|---|---|---|
+| `name` | string | required | Agent callsign, e.g. "leonardo" or "@leonardo" (case-insensitive), or a session id |
+| `turns` | integer | default `6` | How many recent exchanges (a user ask and what followed) to include |
+| `max_chars` | integer | default `4000` | Hard cap on the output |
+
+#### `agent_transcript` · read-only
+
+Older condensed turns of an agent's conversation (user / agent / tool / paper lines, numbered #seq), `limit` at a time, ending before turn `before` (default: the newest). Each page says what `before` to pass for the next one.
+
+| param | type | | description |
+|---|---|---|---|
+| `name` | string | required | Agent callsign, e.g. "leonardo" or "@leonardo" (case-insensitive), or a session id |
+| `before` | integer | optional | Return turns numbered below this (from a previous page or agent_info) |
+| `limit` | integer | default `30` | Turns per page |
+
+#### `agent_rename`
+
+Give a live agent a different callsign: 2–16 lowercase letters/digits starting with a letter, not "local", and not already an agent's callsign or a machine alias. The name follows the session through handoffs and restarts; on a machine it is also written to the tmux session's @paper_name tag.
+
+| param | type | | description |
+|---|---|---|---|
+| `name_or_id` | string | required | Agent callsign, e.g. "leonardo" or "@leonardo" (case-insensitive), or a session id |
+| `new_name` | string | required | The new callsign, e.g. "hypatia" |
 
 <!-- tools:end -->
 
@@ -934,6 +1080,11 @@ ui_eval { code: "window.__paper.store.getState().tabs.length" }
   functions into `"[function]"`.
 - The Claude provider pins `--session-id` so the transcript path is known up front; Codex names its own rollout
   file, so `usage` polls until it appears. Handoff relies on both transcripts being flushed on SIGTERM.
+- **Symlinked directories.** Claude slugs its project folder from the *physical* cwd (`/tmp/x` → `-private-tmp-x` on
+  macOS), so `projectDir` resolves `realpath` first; without it a session started in a symlinked dir never found its
+  transcript (no usage, no title, no activity).
+- **⌘R before the first prompt.** A local agent with no transcript yet restarts fresh instead of `--resume` (which
+  would fail with "No conversation found").
 - **Transcript binding.** Claude writes its transcript only after the first prompt. `findTranscript` with a pinned id
   must return "not yet", never fall back to "newest `.jsonl` in the folder" — that once bound each new tab to the
   busy tab before it (wrong title, usage, and ⌘R/handoff resuming the wrong conversation). Fallback scans (Codex)

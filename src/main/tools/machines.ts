@@ -67,8 +67,8 @@ export const machineTools = [
     name: 'machine_update',
     title: 'Update machine',
     description:
-      'Change a registered machine\'s label, note, default working directory, or whether its agents may hand themselves back ' +
-      'to this Mac. Pass "" to clear a text field.',
+      'Change a registered machine\'s label, note, default working directory, whether its agents may hand themselves back ' +
+      'to this Mac, or whether they may look at other agents. Pass "" to clear a text field.',
     group: 'machines',
     input: {
       alias: ALIAS,
@@ -77,6 +77,10 @@ export const machineTools = [
       default_cwd: z.string().optional().describe('Default working directory on the machine (absolute or ~/...)'),
       allow_agent_handoff_to_local: z.boolean().optional().describe(
         'Whether agents running on this machine may move themselves back to this Mac through the gateway (default true)'
+      ),
+      allow_agent_introspection: z.boolean().optional().describe(
+        'Whether agents running on this machine may list the other Paper agents and read what they are doing, including ' +
+        'their recent conversation, through the gateway (agents_list/agent_info/agent_transcript and the @mention brief; default true)'
       )
     },
     mutates: true,
@@ -85,7 +89,8 @@ export const machineTools = [
         label: args.label,
         note: args.note,
         defaultCwd: args.default_cwd,
-        allowAgentHandoffToLocal: args.allow_agent_handoff_to_local
+        allowAgentHandoffToLocal: args.allow_agent_handoff_to_local,
+        allowAgentIntrospection: args.allow_agent_introspection
       })
     }))
   }),

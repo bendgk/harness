@@ -9,6 +9,7 @@ import { uiTools } from './ui'
 import { devTools } from './dev'
 import { stateTools } from './state'
 import { machineTools } from './machines'
+import { agentTools } from './agents'
 import type { ToolDef } from './types'
 
 export const TOOLS: ToolDef[] = [
@@ -17,7 +18,8 @@ export const TOOLS: ToolDef[] = [
   ...uiTools,
   ...devTools,
   ...stateTools,
-  ...machineTools
+  ...machineTools,
+  ...agentTools
 ] as unknown as ToolDef[]
 
 export function findTool(name: string): ToolDef | undefined {

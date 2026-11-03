@@ -1,5 +1,6 @@
 import { basename } from 'node:path'
-import type { Provider, RemotePlan, SpawnPlan, TranscriptRead } from './types'
+import { newActivity } from './activity'
+import type { Provider, RemotePlan, SpawnPlan, TranscriptRead, TranscriptState } from './types'
 
 /**
  * A plain login shell. It has no account, no transcript and no usage — it is
@@ -35,6 +36,16 @@ export const shellProvider: Provider = {
   },
 
   readTranscript(): TranscriptRead {
+    return { usage: {} }
+  },
+
+  newState(): TranscriptState {
+    return { v: 1, u: {}, act: newActivity(0) }
+  },
+
+  fold(): void { /* no transcript */ },
+
+  summarize(): TranscriptRead {
     return { usage: {} }
   },
 

@@ -48,7 +48,8 @@ const GROUPS = {
   ui: ['Renderer', 'What is on screen, and driving it.'],
   dev: ['Hot reload & logs', 'Live code loading and diagnostics.'],
   state: ['Persisted state', 'What survives a restart.'],
-  machines: ['Machines', 'Remote computers (ssh host aliases) agents may work on or move to.']
+  machines: ['Machines', 'Remote computers (ssh host aliases) agents may work on or move to.'],
+  agents: ['Agents', 'Agent callsigns (@name) and what each agent is doing, across this Mac and every machine.']
 }
 
 function typeOf(prop) {

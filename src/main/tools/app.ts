@@ -42,7 +42,7 @@ export const appTools = [
       'The manifest of every Paper tool with its JSON-schema input, including tools added since your MCP client connected. ' +
       'Use with tools_invoke to call a tool your client has not loaded yet.',
     group: 'app',
-    input: { group: z.enum(['app', 'sessions', 'ui', 'dev', 'state', 'machines']).optional().describe('Only tools in this group') },
+    input: { group: z.enum(['app', 'sessions', 'ui', 'dev', 'state', 'machines', 'agents']).optional().describe('Only tools in this group') },
     handler: (args, ctx) => ctx.invoke('__manifest', { group: args.group })
   }),
 

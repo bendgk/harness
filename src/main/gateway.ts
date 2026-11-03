@@ -47,7 +47,8 @@ import {
   MachineFailure, classify, muxControl, plainCommand, remotePath, reverseSpec, sshEnv, sshRaw, tunnelControlPath,
   tunnelMasterArgs, upload
 } from './ssh'
-import { handleMcpRequest, type McpScope } from './mcp'
+import { BRIEF_PATH, handleMcpRequest, serveBrief, type McpScope } from './mcp'
+import { ensureRemoteScript } from './hooks'
 import { TOOLS } from './tools'
 import { invokeTool } from './tools/runtime'
 import type { ToolDef, ToolResult } from './tools/types'
@@ -58,14 +59,24 @@ import { LOCAL_HOST, type Machine, type MachineError } from '@shared/types'
  * `self` = the tool's `id` argument is forced to the caller's own session.
  * `remoteOnly` = `host` argument must be a registered machine, never LOCAL_HOST.
  */
-export const REMOTE_SCOPE: Record<string, { self?: boolean; remoteOnly?: boolean }> = {
+export const REMOTE_SCOPE: Record<string, { self?: boolean; remoteOnly?: boolean; introspect?: boolean; caller?: boolean }> = {
   paper_status: {},
   machines_list: {},
   machines_inventory: {},
   sessions_list: {},
   usage_get: { self: true },
   session_handoff: { self: true },
-  session_spawn: { remoteOnly: true }
+  session_spawn: { remoteOnly: true },
+  // `introspect`: reads other agents' activity and conversations — only while the
+  // machine's allowAgentIntrospection is on. `caller`: `from` is forced to the caller.
+  agents_list: { introspect: true, caller: true },
+  agent_info: { introspect: true },
+  agent_transcript: { introspect: true }
+}
+
+/** Whether agents on `alias` may look at other agents (Machine.allowAgentIntrospection, default true). */
+export function introspectionAllowed(alias: string): boolean {
+  return getMachine(alias)?.allowAgentIntrospection !== false
 }
 
 export interface TunnelState {
@@ -166,17 +177,26 @@ function revokeWhere(pred: (t: TokenRecord) => boolean): TokenRecord[] {
 
 const REMOTE_INSTRUCTIONS = `Paper's gateway for agents running on a remote machine. You can see Paper's machines and
 sessions, read your own usage, start sessions on registered machines, and move yourself with session_handoff
-(your own session only; host "local" brings you back to the user's Mac when allowed).`
+(your own session only; host "local" brings you back to the user's Mac when allowed). When the machine allows it,
+agents_list / agent_info / agent_transcript tell you what the user's other Paper agents ("@name") are doing.`
 
 const refuse = (text: string): ToolResult => ({ text, isError: true })
 
 /** Tools as remote callers see them: only the scope, and `id` optional where it is forced anyway. */
-function scopedTools(): ToolDef[] {
-  return TOOLS.filter((t) => REMOTE_SCOPE[t.name]).map((t) =>
-    REMOTE_SCOPE[t.name].self && 'id' in t.input
-      ? { ...t, input: { ...t.input, id: z.string().optional().describe('Always your own session; any other id is refused') } }
-      : t
-  ) as ToolDef[]
+function scopedTools(caller: { host: string }): ToolDef[] {
+  const introspect = introspectionAllowed(caller.host)
+  return TOOLS.filter((t) => REMOTE_SCOPE[t.name] && (introspect || !REMOTE_SCOPE[t.name].introspect)).map((t) => {
+    const rule = REMOTE_SCOPE[t.name]
+    if (rule.self && 'id' in t.input) {
+      return { ...t, input: { ...t.input, id: z.string().optional().describe('Always your own session; any other id is refused') } }
+    }
+    if (rule.caller && 'from' in t.input) {
+      // Filled in by the gateway; not the caller's to choose.
+      const { from: _from, ...input } = t.input as Record<string, unknown>
+      return { ...t, input }
+    }
+    return t
+  }) as ToolDef[]
 }
 
 /** Enforce REMOTE_SCOPE for one caller. Exported for tests. */
@@ -184,7 +204,11 @@ export function scopedInvoke(caller: { sessionId: string; host: string }) {
   return async (name: string, raw: unknown): Promise<ToolResult> => {
     const rule = REMOTE_SCOPE[name]
     if (!rule) return refuse(`${name} is not permitted for remote agents.`)
+    if (rule.introspect && !introspectionAllowed(caller.host)) {
+      return refuse(`Looking at other agents is turned off for agents on ${caller.host} (allowAgentIntrospection is off).`)
+    }
     const args: Record<string, unknown> = raw && typeof raw === 'object' ? { ...(raw as Record<string, unknown>) } : {}
+    if (rule.caller) args.from = caller.sessionId
     if (rule.self) {
       // Never retarget silently: a wrong id is a refusal, not a correction.
       if (args.id !== undefined && args.id !== caller.sessionId) {
@@ -218,12 +242,23 @@ async function handleGateway(req: IncomingMessage, res: ServerResponse): Promise
     res.end()
     return
   }
-  if ((req.url ?? '/').split('?')[0] !== '/mcp') {
+  const path = (req.url ?? '/').split('?')[0]
+  if (path === BRIEF_PATH) {
+    // The remote @mention hook. Same gate as the agent tools: it reveals what other agents are doing.
+    if (!introspectionAllowed(caller.host)) {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('')
+      return
+    }
+    serveBrief(req, res, caller.sessionId)
+    return
+  }
+  if (path !== '/mcp') {
     res.writeHead(404)
     res.end()
     return
   }
-  const scope: McpScope = { tools: scopedTools(), invoke: scopedInvoke(caller), instructions: REMOTE_INSTRUCTIONS, maxBody: 1024 * 1024 }
+  const scope: McpScope = { tools: scopedTools(caller), invoke: scopedInvoke(caller), instructions: REMOTE_INSTRUCTIONS, maxBody: 1024 * 1024 }
   await handleMcpRequest(req, res, scope)
 }
 
@@ -544,20 +579,25 @@ async function absoluteRunFile(alias: string, sessionId: string): Promise<string
 export async function provisionRemoteSession(
   sessionId: string,
   alias: string
-): Promise<{ mcpConfigPath: string; remotePort: number; rotated: boolean }> {
+): Promise<{ mcpConfigPath: string; remotePort: number; rotated: boolean; hook: boolean }> {
   if (!SESSION_ID_RE.test(sessionId)) throw new Error(`invalid session id ${sessionId}`)
   requireMachine(alias)
   // Tunnel first: if it has to move to a new port, it revokes this machine's tokens, which forces a rotation below.
   const tunnel = await ensureTunnel(alias)
   const remotePort = getMachine(alias)?.remotePort
   if (!remotePort) throw new MachineFailure(tunnel.error ?? { kind: 'unknown', message: `no tunnel port for ${alias}`, hint: 'See gateway_status.' })
+  // The @mention hook (hooks.ts) sits next to the config and reads its token from it. Optional: no hook, no brief.
+  const hook = await ensureRemoteScript(alias).then(() => true, (err) => {
+    console.warn(`[gateway] ${alias}: could not upload the mention hook: ${(err as Error).message}`)
+    return false
+  })
 
   if (tokens.some((t) => t.sessionId === sessionId && t.host === alias)) {
     const run = await sshRaw(alias, plainCommand(`[ -f ${remotePath(runFile(sessionId))} ]`), { timeoutMs: 15_000 })
     // Cannot tell (ssh failed): refuse rather than rotate a token a live agent may still be using.
     const failure = classify(alias, run)
     if (failure) throw new MachineFailure(failure)
-    if (run.code === 0) return { mcpConfigPath: await absoluteRunFile(alias, sessionId), remotePort, rotated: false }
+    if (run.code === 0) return { mcpConfigPath: await absoluteRunFile(alias, sessionId), remotePort, rotated: false, hook }
   }
 
   revokeWhere((t) => t.sessionId === sessionId)
@@ -579,7 +619,7 @@ export async function provisionRemoteSession(
     rmSync(tmp, { force: true })
   }
 
-  return { mcpConfigPath: await absoluteRunFile(alias, sessionId), remotePort, rotated: true }
+  return { mcpConfigPath: await absoluteRunFile(alias, sessionId), remotePort, rotated: true, hook }
 }
 
 /** Revoke a session's token and delete its remote config (session closed or handed off elsewhere). */

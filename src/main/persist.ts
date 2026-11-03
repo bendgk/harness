@@ -309,13 +309,21 @@ function restore(): void {
   // Before any CLI relaunches: two processes must never write one transcript.
   report.orphans = reapOrphans(records.filter((r) => isLocal(r.meta) && isAgent(r.meta.provider) && r.meta.nativeSessionId))
 
-  for (const r of records) {
-    try {
-      report.sessions.push(restoreOne(r))
-    } catch (err) {
-      console.error('[persist] could not restore', r.meta.id, err)
-      report.sessions.push({ id: r.meta.id, provider: r.meta.provider, host: r.meta.host, outcome: 'failed', detail: (err as Error).message })
+  // Callsigns live on meta, so they come back as they were. A record from before
+  // callsigns gets one in insert(); reserving every record's name first keeps it
+  // from taking a name a later record already holds.
+  sessionManager.reserveNames(records.flatMap((r) => (r.meta.name ? [r.meta.name.toLowerCase()] : [])))
+  try {
+    for (const r of records) {
+      try {
+        report.sessions.push(restoreOne(r))
+      } catch (err) {
+        console.error('[persist] could not restore', r.meta.id, err)
+        report.sessions.push({ id: r.meta.id, provider: r.meta.provider, host: r.meta.host, outcome: 'failed', detail: (err as Error).message })
+      }
     }
+  } finally {
+    sessionManager.releaseNames()
   }
   const counts = report.sessions.reduce<Record<string, number>>((acc, s) => ({ ...acc, [s.outcome]: (acc[s.outcome] ?? 0) + 1 }), {})
   console.log(`[persist] restored ${report.sessions.length} session(s) after ${report.cleanQuit ? 'quit' : 'crash'}: ${JSON.stringify(counts)}`)

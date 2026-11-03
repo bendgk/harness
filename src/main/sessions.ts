@@ -9,9 +9,13 @@ import { projectSlug } from './providers/claude'
 import { agentEnv, which } from './shell-env'
 import { getAccount, defaultAccountFor } from './accounts'
 import { kernel } from './kernel'
-import { ensureReady, machineContextPrompt, machineEvents, requireMachine } from './machines'
+import {
+  cachedInventories, ensureReady, getMachine, listMachines, machineContextPrompt, machineEvents, requireMachine
+} from './machines'
 import { MachineFailure, assertAlias, interactiveArgs, sshEnv } from './ssh'
 import { ensureTunnel, provisionRemoteSession, revokeRemoteSession } from './gateway'
+import { normaliseAgentName, pickName } from './names'
+import { localHookSettings, remoteHookSettings } from './hooks'
 import { getState } from './store'
 import {
   assertTmuxName, attachCommand, killRemote, launchRemote, readTags, remoteFileExists, remoteState, resolveRemoteDir, setTags,
@@ -130,15 +134,20 @@ function failureInfo(err: unknown): MachineError {
  */
 function contextPrompt(meta: SessionMeta, paperTools = true): string | undefined {
   if (!isAgent(meta.provider)) return undefined
+  // Remote agents reach the agent tools only through the gateway, and only if the machine allows it.
+  const introspect = paperTools && (!isRemote(meta) || getMachine(meta.host)?.allowAgentIntrospection !== false)
   let text = ''
-  try { text = machineContextPrompt({ sessionId: meta.id, host: meta.host }) || '' } catch { /* no machine context */ }
+  try {
+    text = machineContextPrompt({ sessionId: meta.id, host: meta.host, name: meta.name, agentTools: introspect }) || ''
+  } catch { /* no machine context */ }
   if (isRemote(meta)) {
     const where = `You are running on the machine "${meta.host}" (over ssh, inside tmux), started by Paper on the user's computer.`
     const tools = paperTools
       ? 'You can call a limited set of Paper tools (mcp__paper__*) through a private tunnel: `session_handoff` with ' +
         'id = $PAPER_SESSION and host = "local" moves you back to the user\'s Mac (or another machine alias moves you ' +
-        'there) once your current turn ends, with this conversation intact; `machines_list`, `sessions_list`, and ' +
-        '`session_spawn` for sessions on remote machines only.'
+        'there) once your current turn ends, with this conversation intact; `machines_list`, `sessions_list`, ' +
+        `${introspect ? '`agents_list`, `agent_info`, `agent_transcript`, ' : ''}` +
+        'and `session_spawn` for sessions on remote machines only.'
       : 'Paper tools are not available to you in this session; work with the files and commands on this machine.'
     text = [text, `${where} ${tools}`].filter(Boolean).join('\n\n')
   }
@@ -152,14 +161,14 @@ function contextPrompt(meta: SessionMeta, paperTools = true): string | undefined
  * the agent still runs, just without Paper tools, and the pane says why.
  * Codex is skipped: its HTTP MCP auth needs the token in argv or env (see CLAUDE.md).
  */
-async function provisionTools(meta: SessionMeta): Promise<{ mcpConfig?: string; why?: string; rotated?: boolean }> {
+async function provisionTools(meta: SessionMeta): Promise<{ mcpConfig?: string; why?: string; rotated?: boolean; hook?: boolean }> {
   if (meta.provider !== 'claude') return { why: meta.provider === 'codex' ? 'not supported for Codex yet' : undefined }
   try {
     const tunnel = await ensureTunnel(meta.host)
     if (tunnel.state === 'failed') return { why: tunnel.error ? `${tunnel.error.message}. ${tunnel.error.hint}` : 'the tunnel failed' }
     // `rotated`: the token changed, so an agent that is already running still holds the old one.
-    const res: { mcpConfigPath: string; rotated?: boolean } = await provisionRemoteSession(meta.id, meta.host)
-    return { mcpConfig: res.mcpConfigPath, rotated: res.rotated }
+    const res: { mcpConfigPath: string; rotated?: boolean; hook?: boolean } = await provisionRemoteSession(meta.id, meta.host)
+    return { mcpConfig: res.mcpConfigPath, rotated: res.rotated, hook: res.hook }
   } catch (err) {
     return { why: failureInfo(err).message }
   }
@@ -184,6 +193,8 @@ export class SessionManager extends EventEmitter {
       // they are, by definition, local. Backfill so nothing downstream guesses.
       if (!s.meta.host) s.meta.host = LOCAL_HOST
       if (!s.meta.lineage) s.meta.lineage = []
+      // Agents from a generation that predates callsigns get one now (and their tmux tag, if remote).
+      if (this.ensureName(s.meta)) this.retag(s.meta, { name: s.meta.name })
       for (const d of s.subs ?? []) { try { d.dispose() } catch { /* already gone */ } }
       s.subs = []
       if (s.proc) this.attach(s, s.proc)
@@ -204,6 +215,101 @@ export class SessionManager extends EventEmitter {
       if (s.link?.timer) { clearTimeout(s.link.timer); s.link.timer = null }
     }
     this.removeAllListeners()
+  }
+
+  // ---- callsigns (names.ts) -------------------------------------------------
+
+  /** Names held back while persist.ts restores records, so a backfilled name never takes one a later record has. */
+  private reserved = new Set<string>()
+
+  reserveNames(names: Iterable<string>): void {
+    for (const n of names) this.reserved.add(n)
+  }
+
+  releaseNames(): void {
+    this.reserved.clear()
+  }
+
+  /**
+   * Every name `self` may not take: other live agents, agents seen running on
+   * machines (their @paper_name tag; `self`'s own tmux session excluded), every
+   * machine alias (a name must never shadow `@g6e`), `local`, and — when
+   * picking a new name — the ones reserved during restore. Lowercase.
+   */
+  takenNames(self?: SessionMeta, reserved = true): Set<string> {
+    const taken = new Set<string>([LOCAL_HOST])
+    if (reserved) for (const n of this.reserved) taken.add(n)
+    for (const s of this.sessions.values()) {
+      if (s.meta !== self && s.meta.id !== self?.id && s.meta.name) taken.add(s.meta.name.toLowerCase())
+    }
+    for (const m of listMachines()) taken.add(m.alias.toLowerCase())
+    for (const inv of cachedInventories()) {
+      for (const a of inv.agents) {
+        if (!a.name) continue
+        if (self && (a.sessionId === self.id || (inv.alias === self.host && a.tmux === self.remote?.tmux))) continue
+        taken.add(a.name)
+      }
+    }
+    return taken
+  }
+
+  /**
+   * Give an agent a callsign if it has none (or its current one clashes):
+   * `preferred` when valid and free, else a free one from the pool. Shells are
+   * never named. Returns whether `meta.name` changed.
+   */
+  private ensureName(meta: SessionMeta, preferred?: string): boolean {
+    if (!isAgent(meta.provider)) return false
+    const clash = this.takenNames(meta, false)
+    for (const candidate of [preferred, meta.name]) {
+      const n = candidate ? normaliseAgentName(candidate) : null
+      if (n && !clash.has(n)) {
+        const changed = n !== meta.name
+        meta.name = n
+        return changed
+      }
+    }
+    meta.name = pickName(this.takenNames(meta))
+    return true
+  }
+
+  /** Rename an agent (IPC session:setName, tool agent_rename). Unique across agents and machine aliases. */
+  setName(id: string, raw: string): SessionMeta {
+    const s = this.sessions.get(id)
+    if (!s) throw new Error(`No session ${id}`)
+    if (!isAgent(s.meta.provider)) throw new Error('Only agents have callsigns; this session is a terminal.')
+    const name = normaliseAgentName(String(raw ?? ''))
+    if (!name) {
+      throw new Error(`"${raw}" is not a valid callsign: 2–16 lowercase letters or digits, starting with a letter, not "local".`)
+    }
+    if (name === s.meta.name) return s.meta
+    if (listMachines().some((m) => m.alias.toLowerCase() === name)) throw new Error(`@${name} is a machine; pick another callsign.`)
+    if (this.takenNames(s.meta, false).has(name)) throw new Error(`@${name} is already another agent's callsign.`)
+    s.meta.name = name
+    // Re-read the machine once the tag is written, so the inventory shows the new name.
+    const host = s.meta.host
+    this.retag(s.meta, { name }, () => machineEvents.emit('poke', host))
+    this.emit('meta', s.meta)
+    return s.meta
+  }
+
+  /**
+   * A machine was registered whose alias is some agent's callsign. Machines
+   * come from ~/.ssh/config, which the user changes less easily than a name,
+   * so the agent yields: a fresh name and a notice in its pane.
+   */
+  yieldNameTo(alias: string): void {
+    const taken = alias.toLowerCase()
+    for (const s of this.sessions.values()) {
+      if (s.meta.name !== taken) continue
+      const next = pickName(this.takenNames(s.meta))
+      s.meta.name = next
+      const host = s.meta.host
+      this.retag(s.meta, { name: next }, () => machineEvents.emit('poke', host))
+      this.writeNotice(s, `\r\n  renamed @${taken} → @${next}: @${taken} is now a machine\r\n`)
+      this.emit('meta', s.meta)
+      console.log(`[names] ${s.meta.id}: @${taken} → @${next} (machine registered)`)
+    }
   }
 
   /** See liveRef: async continuations go through the newest generation. */
@@ -256,6 +362,8 @@ export class SessionManager extends EventEmitter {
       host,
       lineage: account ? [{ accountId: account.id, at: Date.now(), host }] : []
     }
+    // Agents get a callsign (the asked-for one if it is valid and free); shells never do.
+    this.ensureName(meta, req.name)
     const session: Session = {
       meta,
       proc: null,
@@ -289,6 +397,8 @@ export class SessionManager extends EventEmitter {
       subs: []
     }
     this.sessions.set(meta.id, session)
+    // Restored records from before callsigns (or one whose name is now a machine) get one here.
+    this.ensureName(meta)
     this.emit('meta', meta)
     return session
   }
@@ -319,12 +429,17 @@ export class SessionManager extends EventEmitter {
       return
     }
 
+    // Agents get Paper's own MCP server (PAPER_MCP=0 opts out); Claude also gets the @mention hook.
+    const mcpUrl = isAgent(meta.provider) && process.env.PAPER_MCP !== '0' && kernel().mcp.url ? kernel().mcp.url : undefined
     const plan = provider.plan({
       home: account?.home ?? '',
       cwd: meta.cwd,
       resume: opts.resume,
       prompt: opts.prompt,
-      systemPrompt: contextPrompt(meta)
+      systemPrompt: contextPrompt(meta, Boolean(mcpUrl)),
+      mcpUrl,
+      paperSession: meta.id,
+      settings: mcpUrl && meta.provider === 'claude' ? localHookSettings() : undefined
     })
     meta.nativeSessionId = plan.nativeSessionId || meta.nativeSessionId
     if (plan.transcriptPath) meta.transcriptPath = plan.transcriptPath
@@ -433,7 +548,9 @@ export class SessionManager extends EventEmitter {
         sessionId,
         prompt: opts.prompt,
         mcpConfig: tools.mcpConfig,
-        systemPrompt: contextPrompt(meta, Boolean(tools.mcpConfig))
+        systemPrompt: contextPrompt(meta, Boolean(tools.mcpConfig)),
+        // The hook reads the gateway token from that same config, so it only makes sense with one.
+        settings: tools.mcpConfig && tools.hook ? remoteHookSettings() : undefined
       })
       const nativeId = plan.nativeSessionId || meta.nativeSessionId
       const result = await launchRemote({
@@ -445,7 +562,7 @@ export class SessionManager extends EventEmitter {
         bin: plan.bin,
         args: plan.args,
         env: { COLORTERM: 'truecolor', PAPER_SESSION: meta.id, PAPER_HOST: alias },
-        tags: { id: meta.id, provider: meta.provider, native: nativeId, cwd: meta.cwd, title: meta.title },
+        tags: { id: meta.id, provider: meta.provider, native: nativeId, cwd: meta.cwd, title: meta.title, name: meta.name },
         reattach: Boolean(opts.reattach)
       })
       if (gen !== link.gen) return
@@ -600,9 +717,9 @@ export class SessionManager extends EventEmitter {
   }
 
   /** Best-effort: mirror a meta change into the session's @paper_* tags, so the machine stays the source of truth. */
-  private retag(meta: SessionMeta, tags: RemoteTags): void {
+  private retag(meta: SessionMeta, tags: RemoteTags, after?: () => void): void {
     if (!isRemote(meta) || !meta.remote?.tmux) return
-    void setTags(meta.host, meta.remote.tmux, tags).catch(() => {})
+    void setTags(meta.host, meta.remote.tmux, tags).catch(() => {}).finally(() => after?.())
   }
 
   /**
@@ -632,11 +749,16 @@ export class SessionManager extends EventEmitter {
       createdAt: Date.now(),
       host: alias,
       remote: { tmux: name, link: 'connecting' },
-      lineage: account ? [{ accountId: account.id, at: Date.now(), nativeSessionId: tags.native, host: alias }] : []
+      lineage: account ? [{ accountId: account.id, at: Date.now(), nativeSessionId: tags.native, host: alias }] : [],
+      // Keep the callsign the machine says it has; insert() replaces it only if it clashes (or is missing).
+      name: isAgent(provider) ? normaliseAgentName(tags.name ?? '') ?? undefined : undefined
     }
     const session = this.insert(meta)
-    // The tmux session may carry another Paper's id; from now on it carries ours.
-    if (id !== tags.id) this.retag(meta, { id })
+    // The tmux session may carry another Paper's id or name; from now on it carries ours.
+    const retag: RemoteTags = {}
+    if (id !== tags.id) retag.id = id
+    if (meta.name && meta.name !== tags.name) retag.name = meta.name
+    if (retag.id || retag.name) this.retag(meta, retag)
     await this.startRemote(session, { resume: tags.native, reattach: true })
     return meta
   }
@@ -830,7 +952,9 @@ export class SessionManager extends EventEmitter {
     const reattach = isRemote(s.meta) && (!s.proc || s.meta.remote?.link !== 'attached')
     this.kill(id, 'SIGKILL')
     if (!reattach) s.buffer = ''
-    this.start(s, { resume: s.meta.nativeSessionId, reattach })
+    // A local agent that was never prompted has no conversation yet; `--resume` of it would just fail.
+    const said = isRemote(s.meta) || Boolean(s.meta.transcriptPath && existsSync(s.meta.transcriptPath))
+    this.start(s, { resume: said ? s.meta.nativeSessionId : undefined, reattach })
   }
 
   /**

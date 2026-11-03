@@ -17,6 +17,7 @@ import {
   updateMachine, type MachineInput
 } from './machines'
 import { shutdownGateway, startGateway } from './gateway'
+import { listAgents } from './agents'
 import { LOCAL_HOST, type AgentProviderId, type AppSnapshot, type MachineHandoffRequest, type SpawnRequest, type Tab } from '@shared/types'
 
 export const usageTracker = new UsageTracker(sessionManager)
@@ -198,6 +199,10 @@ export function registerIpc(): () => void {
   handle('session:steer', (id: string, prompt: string) => sessionManager.steer(id, prompt))
   handle('session:restart', (id: string) => sessionManager.restart(id))
   handle('session:rename', (id: string, title: string) => sessionManager.patchMeta(id, { title, titleIsAi: true }))
+  // Callsign: validated, unique across agents and machine aliases; emits session:update; retags a remote's tmux.
+  handle('session:setName', (id: string, name: string) => sessionManager.setName(id, name))
+  // Every named agent, live (exited included, the UI decides) and detached on machines. Memory only.
+  handle('agents:list', () => listAgents({ includeExited: true }))
   handle('session:close', (id: string) => {
     sessionManager.close(id)
     usageTracker.forget(id)

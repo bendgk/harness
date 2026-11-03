@@ -9,6 +9,7 @@ import {
   addMachine, execOnMachine, inventory, listMachines, probeMachine, removeMachine, suggestMachines, updateMachine
 } from '../machines'
 import { gatewayStatus } from '../gateway'
+import { agentInfo, agentTranscript, listAgents, renameAgent } from '../agents'
 import { SESSIONS_FILE, readRegistry, restoreReport } from '../persist'
 import { invokeTool } from './runtime'
 import type { ToolContext } from './types'
@@ -31,6 +32,7 @@ export function createToolContext(): ToolContext {
       inventory,
       gateway: gatewayStatus
     },
+    agents: { list: listAgents, info: agentInfo, transcript: agentTranscript, rename: renameAgent },
     getState,
     saveState,
     accounts: () => listAccounts().map((a) => ({ ...a, plan: describeAccount(a) ?? a.plan })),

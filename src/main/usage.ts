@@ -2,7 +2,9 @@ import { EventEmitter } from 'node:events'
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, chmodSync, existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, join } from 'node:path'
-import { providerFor } from './providers'
+import { providerFor, type TranscriptState } from './providers'
+import { readFrom } from './providers/transcript'
+import type { Activity } from './providers/activity'
 import { getAccount } from './accounts'
 import { kernel } from './kernel'
 import { PAPER_HOME } from './paths'
@@ -60,6 +62,26 @@ function emptySnapshot(sessionId: string, provider: ProviderId): UsageSnapshot {
   }
 }
 
+/**
+ * Where reading a transcript got to. The state is the provider's folded
+ * TranscriptState (usage counters + activity); `carry` is the partial last
+ * line, completed by the next read. Lives in a kernel slot, so a hot swap
+ * does not re-read hundreds of MB — unless the state's version changed.
+ */
+interface Cursor {
+  path: string
+  ino: number
+  offset: number
+  /** File size and mtime when last fully caught up. */
+  size: number
+  mtime: number
+  carry: Buffer | null
+  state: TranscriptState
+}
+
+/** Bytes of transcript read per tick across all sessions; a 200 MB first read takes a few seconds, never one long freeze. */
+const READ_BUDGET = 48 * 1024 * 1024
+
 interface Track {
   lastMtime: number
   lastTotal: number
@@ -74,6 +96,8 @@ interface Track {
 export class UsageTracker extends EventEmitter {
   // Kept in a kernel slot so burn history survives a hot swap of this module.
   private tracks = kernel().slot('usage.tracks', () => new Map<string, Track>())
+  /** Read position and folded state per session's transcript; plain data, so it survives swaps (see Cursor). */
+  private cursors = kernel().slot('usage.cursors', () => new Map<string, Cursor>())
   private remotePolls = kernel().slot('usage.remote', () => new Map<string, RemotePoll>())
   private timer: NodeJS.Timeout | null = null
 
@@ -93,7 +117,13 @@ export class UsageTracker extends EventEmitter {
 
   forget(sessionId: string): void {
     this.tracks.delete(sessionId)
+    this.cursors.delete(sessionId)
     this.remotePolls.delete(sessionId)
+  }
+
+  /** What the session's agent is doing, as folded from its transcript so far (memory only). */
+  activity(sessionId: string): Activity | undefined {
+    return this.cursors.get(sessionId)?.state.act
   }
 
   snapshot(sessionId: string): UsageSnapshot | undefined {
@@ -156,6 +186,7 @@ export class UsageTracker extends EventEmitter {
       this.sessions.patchMeta(meta.id, { nativeSessionId: real, transcriptPath })
       // Drop the borrowed numbers; the next tick reads the right file, if any yet.
       this.tracks.delete(meta.id)
+      this.cursors.delete(meta.id)
       this.emit('usage', emptySnapshot(meta.id, meta.provider))
       this.emit('rebound', { sessionId: meta.id, staleTitle })
       console.log(`[usage] rebound ${meta.id}: ${wrongId ?? '-'} → ${real}${staleTitle ? ' (title reset)' : ''}`)
@@ -167,6 +198,7 @@ export class UsageTracker extends EventEmitter {
     // hand one of them to a second session.
     const claimed = new Set(this.sessions.list().flatMap((m) => (m.transcriptPath ? [m.transcriptPath] : [])))
     const claimedRemote = new Set(this.sessions.list().flatMap((m) => (m.remote?.transcriptPath ? [m.remote.transcriptPath] : [])))
+    let budget = READ_BUDGET
     for (const meta of this.sessions.list()) {
       const provider = providerFor(meta.provider)
       if (isRemote(meta)) {
@@ -190,17 +222,35 @@ export class UsageTracker extends EventEmitter {
         meta.transcriptPath = found
       }
 
-      let mtime: number
-      try { mtime = statSync(meta.transcriptPath).mtimeMs } catch { continue }
+      let st: ReturnType<typeof statSync>
+      try { st = statSync(meta.transcriptPath) } catch { continue }
+      const mtime = st.mtimeMs
 
       const track = this.tracks.get(meta.id)
-      if (track && track.lastMtime === mtime) {
+      let cur = this.cursors.get(meta.id)
+      // Start over when the file is another one (rebound, handed off, replaced
+      // in place), shrank, or was parsed by code with a different state shape.
+      if (!cur || cur.path !== meta.transcriptPath || cur.ino !== st.ino || st.size < cur.offset || cur.state?.v !== provider.newState(0).v) {
+        cur = { path: meta.transcriptPath, ino: st.ino, offset: 0, size: 0, mtime: 0, carry: null, state: provider.newState() }
+        this.cursors.set(meta.id, cur)
+      }
+      if (track && cur.offset === st.size && cur.mtime === mtime) {
         // No new activity: record a zero so the sparkline decays honestly.
         this.pushBurn(track, 0)
         continue
       }
+      // Only the bytes past what was already folded are read. A big first read
+      // (a 200 MB transcript) is spread over ticks rather than freezing main.
+      if (budget <= 0) continue
+      const res = readFrom(provider, cur.state, meta.transcriptPath, cur, st.size, budget)
+      budget -= res.read
+      cur.offset = res.offset
+      cur.carry = res.carry
+      if (cur.offset < st.size) continue
+      cur.size = st.size
+      cur.mtime = mtime
 
-      const read = provider.readTranscript(meta.transcriptPath)
+      const read = provider.summarize(cur.state)
       if (read.nativeSessionId && read.nativeSessionId !== meta.nativeSessionId) {
         this.sessions.patchMeta(meta.id, { nativeSessionId: read.nativeSessionId })
       }

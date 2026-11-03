@@ -320,13 +320,15 @@ export function between(stdout: Buffer | string): string {
  * Write a local file to `dest` on the remote, atomically, private (umask 077),
  * creating parent directories. `dest` may start with `~/`.
  */
-export async function upload(alias: string, localFile: string, dest: string): Promise<void> {
+export async function upload(alias: string, localFile: string, dest: string, opts: { executable?: boolean } = {}): Promise<void> {
   const script = [
     'set -e',
     'umask 077',
     `p=${remotePath(dest)}`,
     'mkdir -p "$(dirname "$p")"',
     'cat > "$p.paper-part"',
+    // 0700: still private, and runnable by its owner.
+    ...(opts.executable ? ['chmod 700 "$p.paper-part"'] : []),
     'mv -f "$p.paper-part" "$p"'
   ].join('\n')
   const run = await sshRaw(alias, plainCommand(script), { inputFile: localFile, timeoutMs: 120_000 })
@@ -344,6 +346,22 @@ export async function download(alias: string, src: string, offset = 0): Promise<
   if (run.code === 3) return null
   if (run.code !== 0) throw sshError(alias, run, `download ${src}`)
   return run.stdout
+}
+
+/**
+ * The last `bytes` of a remote file (agent_info on a detached remote agent).
+ * `partial` says the file was longer, so the first line is cut off. Null when
+ * the file does not exist.
+ */
+export async function downloadTail(alias: string, src: string, bytes: number): Promise<{ data: Buffer; partial: boolean } | null> {
+  const n = Math.max(1, Math.floor(bytes))
+  const script = [`p=${remotePath(src)}`, '[ -f "$p" ] || exit 3', `exec tail -c ${n + 1} "$p"`].join('\n')
+  const run = await sshRaw(alias, plainCommand(script), { timeoutMs: 30_000, maxBytes: n + 16 })
+  if (run.code === 3) return null
+  if (run.code !== 0) throw sshError(alias, run, `download ${src}`)
+  // One byte more than asked for tells a file of exactly `bytes` from a longer one.
+  const partial = run.stdout.length > n
+  return { data: partial ? run.stdout.subarray(run.stdout.length - n) : run.stdout, partial }
 }
 
 // ---- resolution ----------------------------------------------------------------

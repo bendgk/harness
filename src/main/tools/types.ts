@@ -18,12 +18,20 @@ import type { UsageTracker } from '../usage'
 import type { TitleService } from '../titles'
 import type { HandoffService } from '../handoff'
 import type { Persisted } from '../store'
-import type { Account, Machine, MachineInventory, MachineProbe } from '@shared/types'
+import type { Account, AgentSummary, Machine, MachineInventory, MachineProbe, SessionMeta } from '@shared/types'
 import type { ExecResult, MachineInput } from '../machines'
 import type { TunnelState } from '../gateway'
 import type { RestoreReport, SessionRegistry } from '../persist'
 
-export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state' | 'machines'
+export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state' | 'machines' | 'agents'
+
+/** Agent callsigns and cross-agent awareness (src/main/agents.ts). */
+export interface AgentService {
+  list(opts: { host?: string; includeExited?: boolean; from?: string }): AgentSummary[]
+  info(nameOrId: string, opts: { turns?: number; maxChars?: number }): Promise<string>
+  transcript(nameOrId: string, opts: { before?: number; limit?: number }): Promise<string>
+  rename(nameOrId: string, name: string): SessionMeta
+}
 
 /** The machine registry (src/main/machines.ts) as tools see it. Every alias-taking call enforces the allowlist. */
 export interface MachineService {
@@ -56,6 +64,7 @@ export interface ToolContext {
   titles: TitleService
   handoff: HandoffService
   machines: MachineService
+  agents: AgentService
   getState(): Persisted
   saveState(patch: Partial<Persisted>): void
   accounts(): Account[]

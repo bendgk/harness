@@ -93,9 +93,13 @@ export interface AgentSummary {
   lastPrompt?: string
   /** The latest assistant text, truncated. */
   lastReply?: string
-  /** Open todo items from the agent's own todo list (Claude TodoWrite), if any. */
+  /** Open todo items from the agent's own todo list (Claude TodoWrite / Task tools, Codex update_plan), if any. */
   todos?: { text: string; status: 'pending' | 'in_progress' | 'completed' }[]
   attached: boolean
+  /** The latest tool call as one line, e.g. "Bash: npm test" or "Edit src/x.ts". */
+  lastTool?: string
+  /** Set on the caller's own row when Paper knows who is asking (agents_list from an agent). */
+  self?: boolean
 }
 
 /** Sentinel host for "this computer". Reserved: no Machine may use it as its alias. */
@@ -170,6 +174,14 @@ export interface Machine {
    * Off = a compromised remote cannot steer an agent into local privileges.
    */
   allowAgentHandoffToLocal?: boolean
+  /**
+   * Whether agents running on this machine may list other Paper agents and
+   * read what they are doing — including their recent conversation — through
+   * the gateway (agents_list / agent_info / agent_transcript, the @mention
+   * brief). Default true. Off = a compromised remote learns nothing about the
+   * user's other agents.
+   */
+  allowAgentIntrospection?: boolean
 }
 
 export interface UsageSnapshot {

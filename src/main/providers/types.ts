@@ -1,4 +1,5 @@
 import type { ProviderId, UsageSnapshot } from '@shared/types'
+import type { Activity } from './activity'
 
 export interface SpawnPlan {
   file: string
@@ -36,10 +37,31 @@ export interface PlanOptions {
   sessionId?: string
   /** Remote only: path *on the remote* of the agent's 0600 MCP config for the Paper gateway. */
   mcpConfig?: string
+  /** Local only: Paper's MCP endpoint, when agents get Paper tools (PAPER_MCP != 0). */
+  mcpUrl?: string
+  /** The Paper session id, sent as X-Paper-Session so tools know who is calling (local only; no secret). */
+  paperSession?: string
+  /** Claude only: extra settings JSON for `--settings` (the @mention hook, see hooks.ts). */
+  settings?: string
 }
 
 export interface TranscriptRead {
   usage: Partial<UsageSnapshot>
+  title?: string
+  nativeSessionId?: string
+}
+
+/**
+ * Incremental transcript state: the provider's usage counters plus what the
+ * agent is doing. Plain data (it lives in a kernel slot across hot swaps);
+ * `v` is bumped whenever its shape changes, which makes the usage tracker
+ * re-read the transcript from the start once.
+ */
+export interface TranscriptState {
+  v: number
+  /** Provider-private counters. */
+  u: Record<string, any>
+  act: Activity
   title?: string
   nativeSessionId?: string
 }
@@ -68,8 +90,14 @@ export interface Provider {
     nativeSessionId?: string
     exclude?: ReadonlySet<string>
   }): string | undefined
-  /** Parse a transcript into usage + title. */
+  /** Parse a whole transcript into usage + title (one-off reads: handoff, rebinding). */
   readTranscript(path: string): TranscriptRead
+  /** Fresh state for reading a transcript incrementally (`keep` = condensed turns retained). */
+  newState(keep?: number): TranscriptState
+  /** Fold one parsed JSONL record into the state. Must not depend on seeing the file from the start beyond what the state holds. */
+  fold(state: TranscriptState, rec: any): void
+  /** Usage, title and conversation id from the state so far. */
+  summarize(state: TranscriptState): TranscriptRead
   /** Copy a conversation into another account's home, returning the new transcript path. */
   transplant(opts: { fromPath: string; toHome: string; cwd: string; nativeSessionId: string }): string
   /** Argv for a one-shot, non-interactive prompt (used for titling). */
