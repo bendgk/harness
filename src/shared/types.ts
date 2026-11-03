@@ -123,8 +123,6 @@ export interface Machine {
   note?: string
   /** Default working directory on the remote for new sessions / handoffs. */
   defaultCwd?: string
-  /** Whether agents running on this machine may move themselves to this Mac (session_handoff). Default true. */
-  allowAgentHandoffToLocal?: boolean
   addedAt: number
   probe?: MachineProbe
   /**
