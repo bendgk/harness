@@ -45,8 +45,80 @@ export interface SessionMeta {
   transcriptPath?: string
   createdAt: number
   /** Accounts this session has previously run under, oldest first. */
-  lineage: { accountId: string; at: number; nativeSessionId?: string }[]
+  lineage: { accountId: string; at: number; nativeSessionId?: string; host?: string }[]
   exitCode?: number
+  /**
+   * Where the CLI process runs: LOCAL_HOST, or the ssh alias of a registered
+   * Machine. A local agent can still *work on* machines over ssh; this field
+   * is only about where the agent itself lives.
+   */
+  host: string
+  /** Remote sessions only: the tmux session on `host` that keeps the agent alive. */
+  remote?: {
+    tmux: string
+    /** Transcript path on the remote machine, once known. */
+    transcriptPath?: string
+    /** Attach state of the local ssh client, separate from the agent's own status. */
+    link: 'connecting' | 'attached' | 'reconnecting' | 'lost'
+  }
+  /** Set when this session was brought back after Paper restarted. */
+  restoredAt?: number
+}
+
+/** Sentinel host for "this computer". Reserved: no Machine may use it as its alias. */
+export const LOCAL_HOST = 'local'
+
+/** Why talking to a machine failed, in terms a person can act on. */
+export type MachineErrorKind =
+  | 'auth'          // key rejected / no usable identity / agent empty
+  | 'host-key'      // unknown or changed host key — never auto-accepted
+  | 'dns'           // alias resolves to nothing
+  | 'unreachable'   // refused / no route
+  | 'timeout'
+  | 'missing-tool'  // the CLI, tmux or a coreutil is not installed on the remote
+  | 'not-logged-in' // the harness is installed but has no login on the remote
+  | 'remote-dir'    // working directory does not exist on the remote
+  | 'unknown'
+
+export interface MachineError {
+  kind: MachineErrorKind
+  /** One-line summary, e.g. "g6e rejected the ssh key". */
+  message: string
+  /** What the human should do; Paper never tries to fix these itself. */
+  hint: string
+  /** Raw stderr tail, for the details disclosure. */
+  detail?: string
+}
+
+/** Result of `ssh <alias>` capability probe. */
+export interface MachineProbe {
+  at: number
+  ok: boolean
+  error?: MachineError
+  /** From `ssh -G`: what the alias actually points at. */
+  target?: { hostname: string; user: string; port: number }
+  os?: string
+  /** Remote $HOME and the CLI homes the remote harnesses use. */
+  home?: string
+  claudeHome?: string
+  codexHome?: string
+  /** Version string (or path) per tool; absent means not installed. */
+  tools: { claude?: string; codex?: string; tmux?: string }
+  latencyMs?: number
+}
+
+/** A computer agents are allowed to ssh into, named by its ~/.ssh/config alias. */
+export interface Machine {
+  /** The ssh host alias, e.g. "g6e". Validated: [A-Za-z0-9_][A-Za-z0-9._-]*, never 'local'. */
+  alias: string
+  /** Optional display label; the alias is what agents and @mentions use. */
+  label?: string
+  /** Free-form note shown to agents, e.g. "8×L40S GPU box, repos in ~/work". */
+  note?: string
+  /** Default working directory on the remote for new sessions / handoffs. */
+  defaultCwd?: string
+  addedAt: number
+  probe?: MachineProbe
 }
 
 export interface UsageSnapshot {
@@ -127,6 +199,7 @@ export interface AppSnapshot {
   widgets: WidgetPrefs
   /** Directories opened recently, most recent first. */
   recentDirs: string[]
+  machines: Machine[]
 }
 
 /** One completion candidate for the directory bar. */
@@ -161,6 +234,19 @@ export interface SpawnRequest {
   resume?: string
   /** Initial prompt typed into the agent once it boots. */
   prompt?: string
+  /** Where to run the CLI: LOCAL_HOST (default) or a registered machine alias. */
+  host?: string
+}
+
+/** Moving a session to another computer (or back to this one). */
+export interface MachineHandoffRequest {
+  sessionId: string
+  /** Target: LOCAL_HOST or a registered machine alias. */
+  host: string
+  /** Working directory on the target. Default: Machine.defaultCwd, else the same path, else the $HOME-relative equivalent. */
+  cwd?: string
+  /** Typed into the agent once it is running on the target, e.g. "continue the task". */
+  continuePrompt?: string
 }
 
 /** One entry of the tool registry, as exposed to the UI and to `tools_list`. */
@@ -190,6 +276,7 @@ export interface MainEvents {
   'accounts:update': Account[]
   'handoff:progress': { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }
   'app:command': { command: string }
+  'machines:update': Machine[]
   /** A new main-process app bundle was activated (hot reload). */
   'hot:update': { generation: number; at: number; tools: number }
 }

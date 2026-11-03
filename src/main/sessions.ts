@@ -6,7 +6,7 @@ import { isAgent, providerFor } from './providers'
 import { agentEnv, which } from './shell-env'
 import { getAccount, defaultAccountFor } from './accounts'
 import { kernel } from './kernel'
-import type { ProviderId, SessionMeta, SessionStatus, SpawnRequest } from '@shared/types'
+import { LOCAL_HOST, type ProviderId, type SessionMeta, type SessionStatus, type SpawnRequest } from '@shared/types'
 
 /** Bytes of scrollback retained so a pane can re-attach with history intact. */
 const SCROLLBACK_LIMIT = 1_500_000
@@ -92,6 +92,7 @@ export class SessionManager extends EventEmitter {
       cwd,
       status: 'starting',
       createdAt: Date.now(),
+      host: LOCAL_HOST,
       lineage: account ? [{ accountId: account.id, at: Date.now() }] : []
     }
     const session: Session = {

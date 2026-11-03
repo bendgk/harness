@@ -54,7 +54,8 @@ function snapshot(): AppSnapshot {
     accounts: listAccounts().map((a) => ({ ...a, plan: describeAccount(a) ?? a.plan })),
     defaults: state.defaults,
     widgets: state.widgets,
-    recentDirs: state.recentDirs
+    recentDirs: state.recentDirs,
+    machines: state.machines ?? []
   }
 }
 

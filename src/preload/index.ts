@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
-  Account, AgentProviderId, AppSnapshot, DirComplete, SessionMeta, SpawnRequest, Tab, ToolManifestEntry,
-  ToolResult, UsageSnapshot, WidgetPrefs
+  Account, AgentProviderId, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, MachineProbe, SessionMeta,
+  SpawnRequest, Tab, ToolManifestEntry, ToolResult, UsageSnapshot, WidgetPrefs
 } from '@shared/types'
 
 const invoke = <T>(channel: string, ...args: unknown[]): Promise<T> => ipcRenderer.invoke(channel, ...args)
@@ -66,7 +66,22 @@ const api = {
   },
 
   handoff: {
-    switchAccount: (sessionId: string, accountId: string) => invoke<void>('handoff:switch', sessionId, accountId)
+    switchAccount: (sessionId: string, accountId: string) => invoke<void>('handoff:switch', sessionId, accountId),
+    /** Move a session's agent to another computer (or back to LOCAL_HOST), conversation intact. */
+    toMachine: (req: MachineHandoffRequest) => invoke<void>('handoff:machine', req)
+  },
+
+  /** Remote computers agents may ssh into or be moved to (ssh host aliases). */
+  machines: {
+    list: () => invoke<Machine[]>('machines:list'),
+    suggest: () =>
+      invoke<{ alias: string; hostname?: string; user?: string; registered: boolean }[]>('machines:suggest'),
+    add: (input: { alias: string; label?: string; note?: string; defaultCwd?: string }) =>
+      invoke<Machine>('machines:add', input),
+    update: (alias: string, patch: { label?: string; note?: string; defaultCwd?: string }) =>
+      invoke<Machine>('machines:update', alias, patch),
+    remove: (alias: string) => invoke<void>('machines:remove', alias),
+    probe: (alias: string) => invoke<MachineProbe>('machines:probe', alias)
   },
 
   /** The same tool registry the MCP server exposes, callable from the UI. */
@@ -82,6 +97,7 @@ const api = {
   onAccounts: (fn: (a: Account[]) => void) => on('accounts:update', fn),
   onHandoff: (fn: (p: { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }) => void) =>
     on('handoff:progress', fn),
+  onMachines: (fn: (m: Machine[]) => void) => on('machines:update', fn),
   onCommand: (fn: (p: { command: string }) => void) => on('app:command', fn),
   onHot: (fn: (p: { generation: number; at: number; tools: number }) => void) => on('hot:update', fn)
 }

@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { STATE_FILE, ensureDirs } from './paths'
-import type { Account, AgentProviderId, Tab, WidgetPrefs, ProviderId } from '@shared/types'
+import type { Account, AgentProviderId, Machine, Tab, WidgetPrefs, ProviderId } from '@shared/types'
 
 export interface Persisted {
   accounts: Account[]
@@ -13,6 +13,8 @@ export interface Persisted {
   }
   widgets: WidgetPrefs
   recentDirs: string[]
+  /** Registered remote machines (the allowlist agents may use). */
+  machines: Machine[]
 }
 
 const EMPTY: Persisted = {
@@ -21,7 +23,8 @@ const EMPTY: Persisted = {
   activeTabId: null,
   defaults: { provider: 'claude', cwd: process.env.HOME || '/', accountByProvider: {} },
   widgets: { enabled: ['usage', 'context', 'limits', 'burn', 'pet', 'clock'], petName: 'Inky' },
-  recentDirs: []
+  recentDirs: [],
+  machines: []
 }
 
 let state: Persisted = { ...EMPTY }
