@@ -22,8 +22,9 @@
  *
  * Layer 2 — the glide. Rows are still 19.5 px steps, so an opaque canvas laid
  * over `.xterm-screen` shows the content at a continuous position P while a
- * scroll is in progress, and is hidden otherwise (zero cost, pixel-exact text
- * when idle). It composites, per frame:
+ * scroll is in progress and while it rests off the row grid afterwards, and
+ * is hidden otherwise (zero cost, pixel-exact text). It composites, per frame
+ * and on every xterm render:
  *   fixed rows straight from the WebGL canvas (the current frame N),
  *   the scrolling region from N translated by F−P, and the band that reveals
  *   from the previous composite O translated by P_O−P, so it is never blank.
@@ -32,9 +33,11 @@
  * redraws on its own schedule, so the shift and its region are detected by
  * comparing row text with the previous frame (`findShift`); Claude's input
  * box, status rows and the sticky prompt header never match a shift, so they
- * never move, and a chip floating over a scrolling row ("Jump to bottom") is
- * held in place cell by cell (`withChips`). A frame that does not fit is
- * snapped, never glided.
+ * never move, a row redrawn in place (the spinner line) still moves with
+ * the transcript (`editedInPlace`), and a chip floating over a scrolling row
+ * ("Jump to bottom") is held in place cell by cell (`withChips`) and painted
+ * out of the band source (`blankChips`). A frame that does not fit is
+ * snapped, never glided. (Claude's frames arrive whole: see sync-output.ts.)
  *
  * P follows a critically damped spring (with a guard so it can never pass
  * its target, i.e. never overshoots or oscillates). Its target is the finger
@@ -42,10 +45,17 @@
  * requested *ahead* of the finger ("lead": ceil instead of floor, plus a
  * latency look-ahead), and the content tracks the trackpad 1:1 instead of
  * trailing a staircase. While tracking, P never moves faster than 1.3× the
- * finger, even catching up with a late frame. When the gesture ends P settles
- * on the row grid with an exponential that starts at its current speed.
+ * finger, even catching up with a late frame.
  *
- * Typing, clicks, resizes and buffer switches snap and hide the overlay.
+ * No snap at the end: when the gesture ends the target stays the finger, so
+ * the content rests exactly where it was left, off the row grid if need be
+ * (`resting`: rAF stops, the overlay stays and re-composites on each render).
+ * The app's row grid is then moved under it (`retarget`, invisible) so the
+ * band is the top sliver of older transcript, never the live bottom rows.
+ * Mouse events over the region are moved onto the live frame's cells
+ * (`onMouse`), so clicks, selection and links hit what is drawn. Only a notch
+ * glides onto its rows. Typed input, paste, resizes, theme and buffer
+ * switches hide the overlay (the real frame shows); clicks do not.
  * prefers-reduced-motion, or no WebGL canvas, means Layer 1 only.
  */
 import type { IDisposable, Terminal } from '@xterm/xterm'
@@ -59,16 +69,11 @@ export const TUNING = {
   /** Stiffness for a notch's glide: three rows come to rest in ≈ 110 ms. */
   omegaGlide: 70,
   /**
-   * Settling on the row grid after the last event: ω = speed / distance (a
-   * pure exponential that starts at the current speed, so nothing lurches),
-   * kept within these bounds so it neither crawls nor snaps.
-   */
-  omegaSettleMin: 60,
-  omegaSettleMax: 140,
-  /**
    * The gesture (or its momentum) has ended when no event came for two event
-   * intervals (trackpads stream at the display rate), within these bounds. A
-   * false alarm is harmless: settling moves toward the frame, which is ahead.
+   * intervals (trackpads stream at the display rate), within these bounds.
+   * Nothing visible happens then (the content rests where the finger left
+   * it); it only re-targets the app's row grid (`retarget`), so a false
+   * alarm is harmless.
    */
   idleMinMs: 24,
   idleMaxMs: 90,
@@ -99,15 +104,41 @@ export interface SmoothScrollOptions {
    * Code's flip debounce, 2.1.x): send one extra so reversals are not short.
    */
   dropsFlipReport: () => boolean
+  /**
+   * The resting offset changed (a glide came to rest off the row grid, the
+   * region or offset changed while resting, or the overlay went away): DOM
+   * drawn over the screen (the alternate-screen mention tags) re-lays out
+   * with `restShift()`.
+   */
+  onLayout?: () => void
   /** Dev-only trace sink. */
   trace?: (rec: ScrollTraceRecord) => void
+  /** Dev-only: called with what is on screen after every render/frame of an activation (tests diff it). */
+  probe?: (f: ProbeFrame) => void
+}
+
+/** What one frame put on screen, for the dev capture path (never read the overlay's pixels directly). */
+export interface ProbeFrame {
+  kind: 'render' | 'tick' | 'hide'
+  t: number
+  gl: HTMLCanvasElement | null
+  overlay: HTMLCanvasElement | null
+  /** Whether the overlay covers the WebGL canvas right now. */
+  visible: boolean
+  /** Content position of the live frame N and of the composite (css px, continuous across activations). */
+  frameY: number
+  drawnY: number
+  rowH: number
+  region: { top: number; bot: number; patches?: { row: number; c0: number; c1: number }[] } | null
+  /** Row text of N. */
+  rows: string[]
 }
 
 type Mode = 'report' | 'scrollback' | 'native'
 
 export interface ScrollTraceRecord {
   t: number
-  kind: 'wheel' | 'render' | 'tick' | 'snap'
+  kind: 'wheel' | 'render' | 'tick' | 'snap' | 'retarget' | 'rest'
   mode: Mode
   /** Rows requested so far in this activation (scrollback: absolute viewport row). */
   sent: number
@@ -138,6 +169,9 @@ interface Patch { row: number; c0: number; c1: number }
 interface Region { top: number; bot: number; patches?: Patch[] }
 
 const WHEEL_BUTTON = 4 // CoreMouseButton.WHEEL
+const MOUSE_EVENTS = ['mousedown', 'mouseup', 'mousemove', 'click', 'dblclick', 'auxclick', 'contextmenu'] as const
+/** Events already moved onto the live frame's cells (one pane corrects each). */
+const corrected = new WeakSet<Event>()
 const ACTION_UP = 0
 const ACTION_DOWN = 1
 
@@ -148,6 +182,24 @@ const ACTION_DOWN = 1
  * covers. Rows that changed are compared, not rows that merely repeat (blank
  * lines, rules), so a fixed input box or status line never joins a region.
  */
+/**
+ * Is `b` the row `a` redrawn in place, rather than different content? Claude's
+ * spinner line ("✢ Vibing… (8s · ↓ 214 tokens)") changes glyph, seconds and
+ * tokens every frame, and streamed text grows: such a row is still part of
+ * the transcript and must scroll with it. Letters-only equality (or one being
+ * a prefix of the other) says so; a row replaced by chrome (the sticky header
+ * appearing at the top) shares neither.
+ */
+export function editedInPlace(a: string, b: string): boolean {
+  if (a === b) return true
+  const ta = a.trim()
+  const tb = b.trim()
+  if (ta.length < 4 || tb.length < 4) return false
+  if (ta.startsWith(tb) || tb.startsWith(ta)) return true
+  const la = ta.replace(/[^\p{L}]+/gu, '')
+  return la.length >= 4 && la === tb.replace(/[^\p{L}]+/gu, '')
+}
+
 export function findShift(prev: string[], next: string[], maxS: number): { s: number; top: number; bot: number } | null {
   const n = Math.min(prev.length, next.length)
   let best: { s: number; score: number; first: number; last: number } | null = null
@@ -178,9 +230,12 @@ export function findShift(prev: string[], next: string[], maxS: number): { s: nu
   const dir = Math.sign(s)
   const fits = (r: number): boolean => {
     const src = r + s
-    if (src < 0 || src >= n || next[r] !== prev[src]) return false
+    if (src < 0 || src >= n) return false
     // An unchanged non-blank row is fixed chrome, not transcript.
-    return !(next[r] === prev[r] && next[r].trim() !== '')
+    if (next[r] === prev[r] && next[r].trim() !== '') return false
+    // A row that moved *and* was redrawn (the spinner under the transcript)
+    // still moves with it: left out, it would be drawn twice, fixed and shifted.
+    return next[r] === prev[src] || editedInPlace(prev[src], next[r])
   }
   let { first, last } = best
   while (first > 0 && fits(first - 1)) first--
@@ -233,7 +288,14 @@ export class SmoothScroll {
   private pO = 0
   private drawnP = 0
   private live = false
-  private settleOmega = TUNING.omegaGlide
+  /** Still, off the row grid, overlay up: rAF stopped, renders keep compositing. */
+  private resting = false
+  /** The row grid was moved under the resting content once for this gesture. */
+  private retargeted = false
+  /** Cell and pixel of the last wheel event: re-target reports go there too. */
+  private pointer = { col: 0, row: 0, x: 0, y: 0, alt: false }
+  /** A mouse button went down inside this pane and is still down. */
+  private dragging = false
   private region: Region | null = null
   private lastRows: string[] | null = null
   private raf = 0
@@ -258,6 +320,10 @@ export class SmoothScroll {
       term.buffer.onBufferChange(() => this.cancel('buffer'))
     )
     this.reduced = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null
+    // Capture phase on window: runs before xterm's own listeners (on its
+    // element and, during a drag, on the document), so all of them see the
+    // corrected point.
+    for (const t of MOUSE_EVENTS) window.addEventListener(t, this.onMouse, true)
   }
 
   /** Swallows what xterm's encoder emits while we are generating wheel reports. */
@@ -278,12 +344,65 @@ export class SmoothScroll {
     return {
       mode: this.mode, glide: this.canGlide(), active: this.active, sent: this.sent, shown: this.shown,
       pending: this.pending, pos: this.P, frame: this.shown * this.rowH, v: this.shown * this.rowH - this.P,
-      region: this.region, latency: Math.round(this.latency), rowH: this.rowH, overlay: this.overlay?.style.display ?? 'none'
+      region: this.region, latency: Math.round(this.latency), rowH: this.rowH, overlay: this.overlay?.style.display ?? 'none',
+      resting: this.resting, drawn: this.drawnP
+    }
+  }
+
+  /**
+   * While the overlay shows the content off the row grid: where the live
+   * frame's scrolling rows appear, as a css-px offset `dy` for screen rows
+   * `top..bot` (a row of the live frame at y is on screen at y + dy), plus the
+   * chips, which stay put. Null when the screen shows the live frame as is
+   * or while the content is moving (the overlay then covers everything).
+   */
+  restShift(): { dy: number; top: number; bot: number; patches?: Patch[] } | null {
+    if (!this.active || !this.resting || !this.shownOverlay || !this.region) return null
+    const dy = this.frameY() - this.drawnP
+    if (!dy) return null
+    return { dy, top: this.region.top, bot: this.region.bot, patches: this.region.patches }
+  }
+
+  /**
+   * Mouse hit-testing while the overlay shows the content at P instead of F:
+   * xterm (selection, links, the mention tags, the app's mouse reports) must
+   * find the cell that is drawn under the pointer, not the one the live
+   * frame has there. Points over the scrolling region are moved by F − P
+   * (clamped to the region); fixed rows and chips are where they look.
+   */
+  private onMouse = (ev: MouseEvent): void => {
+    if (corrected.has(ev)) return
+    const el = this.term.element
+    if (!el) return
+    const inside = ev.target instanceof Node && el.contains(ev.target)
+    if (ev.type === 'mousedown') this.dragging = inside
+    const drag = this.dragging
+    if (ev.type === 'mouseup') this.dragging = false
+    if (!inside && !drag) return
+    if (!this.active || !this.shownOverlay || !this.region) return
+    const dy = this.frameY() - this.drawnP
+    if (!dy) return
+    const screen = this.screen()
+    if (!screen) return
+    const r = screen.getBoundingClientRect()
+    const rowH = r.height / this.term.rows
+    const y = ev.clientY - r.top
+    const row = Math.floor(y / rowH)
+    const { top, bot, patches } = this.region
+    if (row < top || row > bot) return
+    const col = Math.floor((ev.clientX - r.left) / (r.width / this.term.cols))
+    if (patches?.some((p) => p.row === row && col >= p.c0 && col <= p.c1)) return
+    const yN = Math.max(top * rowH, Math.min((bot + 1) * rowH - 0.5, y - dy))
+    const d = yN - y
+    corrected.add(ev)
+    for (const k of ['clientY', 'pageY', 'y', 'offsetY', 'layerY', 'screenY'] as const) {
+      Object.defineProperty(ev, k, { value: (ev as MouseEvent)[k] + d, configurable: true })
     }
   }
 
   dispose(): void {
     this.disposed = true
+    for (const t of MOUSE_EVENTS) window.removeEventListener(t, this.onMouse, true)
     this.deactivate('dispose')
     if (this.releaseTimer) clearTimeout(this.releaseTimer)
     this.releaseCanvases()
@@ -355,6 +474,8 @@ export class SmoothScroll {
     if (!(rowH > 0)) return true
     const glide = this.canGlide()
     if (glide) this.activate(rowH)
+    this.retargeted = false
+    this.setResting(false)
     if (!this.live) {
       // A gesture after a full stop starts from the frame (activate() puts
       // travel there); one resumed mid-settle keeps its mapping, and target()
@@ -442,8 +563,19 @@ export class SmoothScroll {
     return E - this.sent
   }
 
-  /** Send n rows. Returns how many reports were written (0 for scrollback). */
+  /** Send n rows at the wheel event's cell. Returns how many reports were written (0 for scrollback). */
   private emit(n: number, ev: WheelEvent, now: number, r: DOMRect): number {
+    const x = Math.max(0, Math.min(r.width - 1, ev.clientX - r.left))
+    const y = Math.max(0, Math.min(r.height - 1, ev.clientY - r.top))
+    this.pointer = {
+      col: Math.min(this.term.cols - 1, Math.floor(x / (r.width / this.term.cols))),
+      row: Math.min(this.term.rows - 1, Math.floor(y / (r.height / this.term.rows))),
+      x: Math.floor(x), y: Math.floor(y), alt: ev.altKey
+    }
+    return this.send(n, now)
+  }
+
+  private send(n: number, now: number): number {
     if (this.mode === 'scrollback') {
       this.term.scrollLines(n)
       this.sent = this.active ? this.term.buffer.active.viewportY : this.sent + n
@@ -453,19 +585,14 @@ export class SmoothScroll {
     let count = Math.abs(n)
     if (this.lastReportDir && dir !== this.lastReportDir && this.opts.dropsFlipReport()) count++
     this.lastReportDir = dir
-    const cellW = r.width / this.term.cols
-    const cellH = r.height / this.term.rows
-    const x = Math.max(0, Math.min(r.width - 1, ev.clientX - r.left))
-    const y = Math.max(0, Math.min(r.height - 1, ev.clientY - r.top))
-    const col = Math.min(this.term.cols - 1, Math.floor(x / cellW))
-    const row = Math.min(this.term.rows - 1, Math.floor(y / cellH))
+    const { col, row, x, y, alt } = this.pointer
     const ms = this.core.coreMouseService
     const out: string[] = []
     this.capturing = out
     try {
       for (let i = 0; i < count; i++) {
         // triggerMouseEvent mutates its argument (1-based coords), so a fresh one each time.
-        ms.triggerMouseEvent({ col, row, x: Math.floor(x), y: Math.floor(y), button: WHEEL_BUTTON, action: dir < 0 ? ACTION_UP : ACTION_DOWN, ctrl: false, alt: ev.altKey, shift: false })
+        ms.triggerMouseEvent({ col, row, x, y, button: WHEEL_BUTTON, action: dir < 0 ? ACTION_UP : ACTION_DOWN, ctrl: false, alt, shift: false })
       }
     } finally {
       this.capturing = null
@@ -552,10 +679,12 @@ export class SmoothScroll {
     if (!this.active) return
     this.active = false
     this.live = false
+    this.setResting(false)
     if (this.raf) cancelAnimationFrame(this.raf)
     this.raf = 0
     if (this.overlay) this.overlay.style.display = 'none'
     this.shownOverlay = false
+    this.emitProbe('hide')
     if (this.mode === 'report') this.base += this.shown
     // Rows still in flight just land unglided; Layer 1 restarts from here.
     this.pending = this.pendingAbs = 0
@@ -576,39 +705,94 @@ export class SmoothScroll {
   }
 
   /**
-   * A row at the region's edge can scroll *under* a floating chip — Claude
-   * Code's "Jump to bottom (click) ↓" sits on the last transcript row whenever
-   * it is scrolled up. Text matching cannot call that row either scrolling or
-   * fixed, so: a run of cells with an explicit background whose text was
-   * already in that row last frame is a chip. The row joins the region and
-   * the chip is drawn fixed from N on top; neither source draws it shifted.
+   * Chips: short runs of cells with an explicit background that float over
+   * the transcript and stay put while it scrolls under them — Claude Code's
+   * "Jump to bottom (click) ↓" on the last transcript row whenever it is
+   * scrolled up. Such a row is neither scrolling nor fixed, so it joins the
+   * region and the chip is drawn fixed, from N, on top (`draw`); the band
+   * source never keeps a copy of it (`blankChips`).
+   *
+   * A run is a chip when it did not travel with its row (its text is not the
+   * shifted source's text at those cells) and either the rest of the row is
+   * that source, shifted (a chip that just appeared over moving content), or
+   * the run was already in this place last frame. Long runs (Claude's
+   * full-width prompt rows) and runs that came along with the content are
+   * content. `s` is the frame's shift (0: not a scroll); `keep` = the patches
+   * so far, kept on rows whose text did not change.
    */
-  private withChips(region: Region, prev: string[], next: string[]): Region {
+  private withChips(region: Region, prev: string[], next: string[], s: number, keep?: Patch[]): Region {
     const b = this.term.buffer.active
+    const cols = this.term.cols
+    const rows = this.term.rows
     const patches: Patch[] = []
-    for (const row of [region.bot + 1, region.top - 1]) {
-      if (row < 0 || row >= this.term.rows || next[row] === prev[row]) continue
+    const pad = (t: string, n: number): string => (t.length < n ? t.padEnd(n) : t)
+    const mask = (t: string, i0: number, i1: number): string => {
+      const p = pad(t, i1)
+      return (p.slice(0, i0) + ' '.repeat(i1 - i0) + p.slice(i1)).trimEnd()
+    }
+    const lo = Math.max(0, region.top - 1)
+    const hi = Math.min(rows - 1, region.bot + 1)
+    for (let row = lo; row <= hi; row++) {
+      const src = row + s
+      const from = src >= 0 && src < rows ? prev[src] : ''
+      const inside = row >= region.top && row <= region.bot
+      if (next[row] === prev[row] && s === 0) {
+        for (const p of keep ?? []) if (p.row === row && inside) patches.push(p)
+        continue
+      }
+      // A row that moved intact carries no overlay.
+      if (next[row] === from) continue
       const line = b.getLine(b.viewportY + row)
       if (!line) continue
       let cell = line.getCell(0)
       let start = -1
+      let i0 = 0
+      let idx = 0
       let text = ''
-      for (let x = 0; x <= this.term.cols; x++) {
-        cell = x < this.term.cols ? line.getCell(x, cell) : undefined
-        const chip = !!cell && cell.getBgColorMode() !== 0
-        if (chip) { if (start < 0) { start = x; text = '' } text += cell!.getChars() || ' ' }
-        else if (start >= 0) {
-          if (x - start >= 4 && text.trim().length >= 3 && prev[row].includes(text.trim())) patches.push({ row, c0: start, c1: x - 1 })
+      let found = false
+      for (let x = 0; x <= cols; x++) {
+        cell = x < cols ? line.getCell(x, cell) : undefined
+        if (cell && cell.getWidth() === 0) continue
+        const chars = cell ? cell.getChars() || ' ' : ''
+        if (cell && cell.getBgColorMode() !== 0) {
+          if (start < 0) { start = x; i0 = idx; text = '' }
+          text += chars
+        } else if (start >= 0) {
+          const i1 = i0 + text.length
+          const n = x - start
+          if (n >= 4 && n <= cols * 0.6 && text.trim().length >= 3) {
+            const travels = pad(from, i1).slice(i0, i1) === text
+            const stayed = pad(prev[row], i1).slice(i0, i1) === text
+            const under = mask(next[row], i0, i1) === mask(from, i0, i1)
+            if (!travels && (under || stayed)) { patches.push({ row, c0: start, c1: x - 1 }); found = true }
+          }
           start = -1
         }
+        idx += chars.length
       }
-      if (patches.some((p) => p.row === row)) {
+      if (found && !inside) {
         if (row > region.bot) region.bot = row
         else region.top = row
       }
     }
-    if (patches.length) region.patches = patches
+    region.patches = patches.length ? patches : undefined
     return region
+  }
+
+  /**
+   * Paint the chips out of the band source. O is the composite (or frame) on
+   * screen, chip included; shifted, its copy of the chip would slide along
+   * with the content as a second, moving chip, and show through the hole the
+   * fixed chip leaves in N's shifted rows.
+   */
+  private blankChips(...lists: (Patch[] | undefined)[]): void {
+    const ctx = this.pctx
+    const c = this.prev
+    if (!ctx || !c) return
+    const rh = c.height / this.term.rows
+    const cw = c.width / this.term.cols
+    ctx.fillStyle = this.term.options.theme?.background ?? '#000000'
+    for (const list of lists) for (const p of list ?? []) ctx.fillRect(p.c0 * cw, p.row * rh, (p.c1 - p.c0 + 1) * cw, rh)
   }
 
   /** Make the current composite the band source, then move F. */
@@ -616,6 +800,8 @@ export class SmoothScroll {
     // What is on screen becomes the band source: the composite, or (before the
     // overlay went up) the frame prev already holds.
     if (this.shownOverlay) this.pctx!.drawImage(this.overlay!, 0, 0)
+    // Chips are screen-fixed: whichever was on screen sits where either list says.
+    this.blankChips(this.region?.patches, region.patches)
     this.pO = this.drawnP
     this.shown += shift
     this.region = region
@@ -630,6 +816,7 @@ export class SmoothScroll {
     this.P = this.pO = this.frameY()
     this.pv = 0
     this.pctx?.drawImage(this.gl!, 0, 0)
+    this.blankChips(this.region?.patches)
     this.record({ t: performance.now(), kind: 'snap', reason, ms: 0 })
   }
 
@@ -638,7 +825,7 @@ export class SmoothScroll {
     const t0 = performance.now()
     let shift: number | undefined
     let reason: string | undefined
-    if (!this.gl?.isConnected || this.overlay?.width !== this.gl.width || this.overlay?.height !== this.gl.height) {
+    if (!this.canvasesMatch()) {
       this.deactivate('canvas')
       return
     }
@@ -658,7 +845,7 @@ export class SmoothScroll {
         this.pendingAbs = Math.max(0, this.pendingAbs - Math.abs(hit.s))
         if (!this.pendingAbs) this.pending = 0
         this.latency += 0.3 * (Math.max(4, Math.min(80, t0 - this.lastSendAt)) - this.latency)
-        this.accept(hit.s, this.withChips({ top: hit.top, bot: hit.bot }, prev, rows))
+        this.accept(hit.s, this.withChips({ top: hit.top, bot: hit.bot }, prev, rows, hit.s))
       } else if (this.region && this.P !== this.frameY()) {
         // Not a scroll. Small edits inside the region (a spinner, the sticky
         // header appearing) glide along; an edge row that changed is fixed
@@ -666,18 +853,28 @@ export class SmoothScroll {
         let changed = 0
         for (let r = this.region.top; r <= this.region.bot; r++) if (rows[r] !== prev[r]) changed++
         if (changed) {
-          while (this.region.top < this.region.bot && rows[this.region.top] !== prev[this.region.top]) { this.region.top++; changed-- }
-          while (this.region.bot > this.region.top && rows[this.region.bot] !== prev[this.region.bot]) { this.region.bot--; changed-- }
+          // (A row merely redrawn in place, like the spinner line, stays.)
+          while (this.region.top < this.region.bot && !editedInPlace(prev[this.region.top], rows[this.region.top])) { this.region.top++; changed-- }
+          while (this.region.bot > this.region.top && !editedInPlace(prev[this.region.bot], rows[this.region.bot])) { this.region.bot--; changed-- }
           if (changed > (this.region.bot - this.region.top + 1) * 0.3) { reason = 'content changed'; this.snapTo(reason) }
+          // A chip can appear (or go) without a scroll, a frame after one.
+          else this.region = this.withChips({ top: this.region.top, bot: this.region.bot }, prev, rows, 0, this.region.patches)
         }
       }
       this.lastRows = rows
     }
     // Same task as the WebGL draw, so the overlay never shows a frame late.
     if (this.shownOverlay || this.P !== this.frameY()) { this.draw(); this.show() }
-    else this.pctx!.drawImage(this.gl!, 0, 0)
+    else { this.pctx!.drawImage(this.gl!, 0, 0); this.blankChips(this.region?.patches) }
+    this.emitProbe('render')
+    if (this.resting) this.layoutIfMoved()
     this.record({ t: t0, kind: 'render', shift, region: this.region ? [this.region.top, this.region.bot] : undefined, reason, ms: performance.now() - t0 })
     this.schedule()
+  }
+
+  private canvasesMatch(): boolean {
+    const gl = this.gl
+    return !!gl?.isConnected && this.overlay?.width === gl.width && this.overlay?.height === gl.height
   }
 
   private schedule(): void {
@@ -687,6 +884,10 @@ export class SmoothScroll {
   private tick = (now: number): void => {
     this.raf = 0
     if (!this.active) return
+    // A font change resizes the WebGL canvas (and clears it) before xterm's
+    // next render: compositing it into the old-sized overlay would show a
+    // stretched or blank frame for one frame.
+    if (!this.canvasesMatch()) { this.deactivate('canvas'); return }
     const t0 = performance.now()
     const dt = Math.max(0, Math.min(0.05, (now - this.lastTick) / 1000))
     this.lastTick = now
@@ -695,30 +896,80 @@ export class SmoothScroll {
     if (this.pendingAbs && t0 - this.lastSendAt > Math.max(TUNING.pendingMs, 4 * this.latency)) {
       this.pending = this.pendingAbs = 0
       this.sent = this.shown
-      this.travel = this.extreme = F0
+      // A finger pushing past the end must not be followed later; once the
+      // gesture is over the content stays put whatever went unanswered.
+      if (this.live) this.travel = this.extreme = F0
     }
-    if (this.live && t0 - this.lastWheel > Math.max(TUNING.idleMinMs, Math.min(TUNING.idleMaxMs, 2 * this.gap))) {
-      // The gesture is over: settle on the row grid from the current speed.
-      this.live = false
-      const d = Math.abs(F0 - this.P)
-      const toward = Math.sign(F0 - this.P) === Math.sign(this.pv) ? Math.abs(this.pv) : 0
-      this.settleOmega = d > 0.01 ? Math.max(TUNING.omegaSettleMin, Math.min(TUNING.omegaSettleMax, toward / d)) : TUNING.omegaGlide
-    }
+    // The gesture (or its momentum) is over. Nothing moves because of it:
+    // the content stays where the finger left it, off the row grid if need be.
+    if (this.live && t0 - this.lastWheel > Math.max(TUNING.idleMinMs, Math.min(TUNING.idleMaxMs, 2 * this.gap))) this.live = false
     this.step(dt)
     if (this.shownOverlay) this.draw()
     const F = this.frameY()
+    this.emitProbe('tick')
     this.record({ t: now, kind: 'tick', ms: performance.now() - t0 })
-    if (!this.live && !this.pendingAbs && this.P === F && this.pv === 0) {
-      this.deactivate('settled')
-      return
+    if (!this.live && !this.pendingAbs && this.pv === 0) {
+      // On the grid: the live frame is exactly what is shown, hide the overlay.
+      if (this.P === F) { this.deactivate('settled'); return }
+      if (this.P === this.target().T) {
+        // At rest off the grid. Stop ticking; every render still composites.
+        if (this.retarget()) { this.schedule(); return }
+        this.setResting(true)
+        return
+      }
     }
     this.schedule()
   }
 
-  /** The finger (while it moves) or the frame (a notch, the settle), within what O and N can show. */
+  /**
+   * At rest the band (the part of a row the live frame does not have) comes
+   * from the previous composite, which cannot follow changes. Keep it on
+   * the side of older, settled transcript: move the app's row grid to the
+   * first row boundary past P toward the end, so the live frame covers
+   * everything from there down — the newest rows, the spinner, the chip —
+   * and the band is the top sliver, above. Invisible: P does not move.
+   */
+  private retarget(): boolean {
+    if (this.retargeted || this.lastNotch || this.pendingAbs) return false
+    this.retargeted = true
+    if (this.frameY() >= this.P) return false
+    let E = Math.ceil(this.P / this.rowH - 1e-6)
+    if (this.mode === 'scrollback') E = Math.min(this.term.buffer.active.baseY, E)
+    const n = E - this.sent
+    if (n <= 0) return false
+    const t = performance.now()
+    const reports = this.send(n, t)
+    this.record({ t, kind: 'retarget', rows: n, reports, ms: 0 })
+    return true
+  }
+
+  private restKey = ''
+
+  private setResting(on: boolean): void {
+    if (on === this.resting) return
+    this.resting = on
+    this.restKey = ''
+    if (on) this.record({ t: performance.now(), kind: 'rest', ms: 0 })
+    this.layoutIfMoved()
+  }
+
+  /** Tell DOM over the screen when what `restShift()` returns has changed. */
+  private layoutIfMoved(): void {
+    const r = this.restShift()
+    const key = r ? `${r.dy}|${r.top}|${r.bot}|${(r.patches ?? []).map((p) => `${p.row}:${p.c0}:${p.c1}`).join(',')}` : ''
+    if (key === this.restKey) return
+    this.restKey = key
+    this.opts.onLayout?.()
+  }
+
+  /**
+   * The finger — while it moves and after it has stopped, so the content
+   * rests exactly where it was left — or, for a notched wheel, the frame
+   * (its rows), within what O and N can show.
+   */
   private target(): { T: number; tracking: boolean } {
     const F = this.frameY()
-    const tracking = this.live && !this.lastNotch
+    const tracking = !this.lastNotch
     const want = tracking ? this.travel : F
     const lo = Math.min(this.pO, F)
     const hi = Math.max(this.pO, F)
@@ -732,9 +983,8 @@ export class SmoothScroll {
 
   private step(dt: number): void {
     const { T, tracking } = this.target()
-    // Following a finger (even one a late frame holds back) stays stiff; a
-    // notch glides; the end of a gesture settles from its own speed.
-    const w = tracking ? TUNING.omegaTrack : this.live ? TUNING.omegaGlide : this.settleOmega
+    // Following a finger (even one a late frame holds back) stays stiff; a notch glides.
+    const w = tracking ? TUNING.omegaTrack : TUNING.omegaGlide
     const x0 = this.P - T
     const v0 = this.pv
     // Exact critically damped step (stable for any dt).
@@ -818,6 +1068,17 @@ export class SmoothScroll {
       }
     }
     this.drawnP = Pd
+  }
+
+  private emitProbe(kind: ProbeFrame['kind']): void {
+    if (!this.opts.probe) return
+    const bp = (this.mode === 'report' ? this.base : 0) * this.rowH
+    this.opts.probe({
+      kind, t: performance.now(), gl: this.gl, overlay: this.overlay, visible: this.overlay?.style.display === 'block',
+      frameY: this.frameY() + bp, drawnY: (this.shownOverlay || kind === 'hide' ? this.drawnP : this.frameY()) + bp, rowH: this.rowH,
+      region: this.region ? { top: this.region.top, bot: this.region.bot, patches: this.region.patches?.map((p) => ({ ...p })) } : null,
+      rows: this.lastRows ?? this.readRows()
+    })
   }
 
   private record(r: Partial<ScrollTraceRecord> & { t: number; kind: ScrollTraceRecord['kind']; ms: number }): void {

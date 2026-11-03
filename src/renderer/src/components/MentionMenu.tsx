@@ -8,8 +8,6 @@ interface Props {
   agents: AgentSummary[]
   machines: Machine[]
   index: number
-  /** Shown for discovery only: no row is selected and keys go to the program. */
-  passive?: boolean
   style?: React.CSSProperties
   /** Which way the menu opens from its anchor (drives the entry animation). */
   placement?: 'above' | 'below'
@@ -33,13 +31,14 @@ export function menuHeight(agents: AgentSummary[], machines: number): number {
  * The @-mention dropdown: agents first (callsign, status, title, where, what
  * it is doing), then machines. One index runs through both sections, so ↑↓
  * walk straight from the last agent to the first machine. Not focusable, and
- * it swallows mousedown so a click never pulls focus out of the terminal or
- * field the user is typing in.
+ * it cancels mousedown (no blur, no text selection, no terminal selection) so
+ * a click inserts the row and leaves the caret in the terminal or field the
+ * user is typing in.
  */
 export default function MentionMenu({
-  agents, machines, index, passive, style, placement = 'below', onPick, onHover
+  agents, machines, index, style, placement = 'below', onPick, onHover
 }: Props): JSX.Element {
-  const on = (i: number): boolean => !passive && i === index
+  const on = (i: number): boolean => i === index
   return (
     <div
       className={`mention-menu mention-${placement} fade-in`}
@@ -97,7 +96,7 @@ export default function MentionMenu({
         )
       })}
       <div className="mention-foot mono">
-        {passive ? 'keep typing to pick an agent or machine' : '↑↓ choose · tab/↵ insert · esc dismiss'}
+        ↑↓ choose · tab/↵ insert · esc dismiss
       </div>
     </div>
   )

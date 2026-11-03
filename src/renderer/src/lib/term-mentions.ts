@@ -119,6 +119,13 @@ export function locateToken(term: Terminal, query: string): { row: number; col: 
 
 export interface MentionColors { fg: string; bg: string }
 
+/**
+ * Where the smooth-scroll overlay is showing the live frame's scrolling rows
+ * while it rests off the row grid (see `SmoothScroll.restShift`): rows
+ * top..bot are drawn `dy` css px from where the buffer has them.
+ */
+export interface ScreenShift { dy: number; top: number; bot: number }
+
 /** What an `@word` refers to: a registered machine or a named agent. */
 export type MentionKind = 'machine' | 'agent'
 
@@ -202,6 +209,16 @@ export class MentionHighlighter {
   /** Tags drawn over the alternate screen, keyed like `live` (row:x:width). */
   private overlay: HTMLDivElement | null = null
   private overlayKeys = ''
+  private lastFound: { row: number; x: number; width: number; text: string; kind: MentionKind }[] = []
+  private shift: () => ScreenShift | null = () => null
+
+  /** Follow the smooth-scroll overlay's resting offset (alternate screen only; decorations are in the frame). */
+  setShift(fn: () => ScreenShift | null): void { this.shift = fn }
+
+  /** The resting offset changed: move the tags, no rescan. */
+  relayout(): void {
+    if (this.term.buffer.active.type !== 'normal') this.paintAlternate(this.lastFound)
+  }
 
   private clearOverlay(): void {
     if (this.overlay) this.overlay.replaceChildren()
@@ -219,7 +236,11 @@ export class MentionHighlighter {
     const term = this.term
     const screen = term.element?.querySelector('.xterm-screen') as HTMLElement | null
     if (!screen) return
-    const keys = matches.map((m) => `${m.row}:${m.x}:${m.width}:${m.text}:${m.kind}`).join('|')
+    this.lastFound = matches
+    // While the glide overlay rests off the grid it covers the screen
+    // (z-index 9): the tags go above it, moved with the rows they sit on.
+    const sh = this.shift()
+    const keys = matches.map((m) => `${m.row}:${m.x}:${m.width}:${m.text}:${m.kind}`).join('|') + (sh ? `|@${sh.dy}:${sh.top}:${sh.bot}` : '')
     if (keys === this.overlayKeys && this.overlay?.isConnected) return
     if (!this.overlay || !this.overlay.isConnected) {
       this.overlay = document.createElement('div')
@@ -228,17 +249,24 @@ export class MentionHighlighter {
       screen.appendChild(this.overlay)
     }
     this.overlayKeys = keys
+    this.overlay.style.zIndex = sh ? '10' : '7'
     const cellW = screen.clientWidth / term.cols
     const cellH = screen.clientHeight / term.rows
     const font = term.options
-    const nodes = matches.map((m) => {
+    const moved = (row: number): number | null => {
+      if (!sh || row < sh.top || row > sh.bot) return row * cellH
+      const y = row * cellH + sh.dy
+      // A tag scrolled (partly) out of the region is hidden like its text.
+      return y < sh.top * cellH - 0.5 || y + cellH > (sh.bot + 1) * cellH + 0.5 ? null : y
+    }
+    const nodes = matches.filter((m) => moved(m.row) !== null).map((m) => {
       const { fg, bg } = this.colors(m.kind)
       const tag = document.createElement('div')
       tag.dataset.mention = m.kind
       Object.assign(tag.style, {
         position: 'absolute',
         left: `${m.x * cellW}px`,
-        top: `${m.row * cellH}px`,
+        top: `${moved(m.row)}px`,
         width: `${m.width * cellW}px`,
         height: `${cellH}px`,
         background: bg,

@@ -66,7 +66,8 @@ src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage
 src/renderer/src/        React + zustand UI. state/store.ts is the app store (HMR-safe, exposed as
                          window.__paper); state/tree.ts is the pane-tree algebra; components/*, widgets/*;
                          lib/machines.ts, lib/agents.ts, lib/term-mentions.ts, lib/dev-fakes.ts (see *Machines
-                         in the UI* and *Agent callsigns in the UI*); lib/smooth-scroll.ts (see *Smooth scrolling*).
+                         in the UI* and *Agent callsigns in the UI*); lib/smooth-scroll.ts, lib/sync-output.ts (see
+                         *Smooth scrolling*).
 src/shared/              Types and pricing used by both sides.
 scripts/sync-tools.mjs   Regenerates the Tools section of this file from the registry.
 ```
@@ -1009,17 +1010,24 @@ Every root agent session (Claude Code / Codex — never shells, never subagents)
   mouse click and blur end it. While the token matches ≥1 agent or machine, `mention` is set in the store and the
   dropdown renders with two sections, **Agents** (dot — pulsing when working —, `@name`, title, `@host` if remote,
   a faint line of `doing`; hover → agent card) then **Machines**; one index runs through both. Opening it calls
-  `refreshAgents()`. A bare `@` is **passive** (shown, but takes no keys — in Claude Code `@` is also the file picker).
-  Once a character is typed, `attachCustomKeyEventHandler` claims ↑ ↓ Tab ↩ Esc (preventDefault + return false,
-  and the keypress/keyup twins are swallowed too, or Enter's keypress would still send `\r`); every other key
-  passes through untouched. Accepting writes the rest of the name/alias plus a space straight to the pty
-  (`completionKeys`: just the tail for a prefix match, otherwise backspaces and the full alias), so the CLI's own
-  picker sees `@g6e ` and closes. In a plain shell's alternate screen (vim, less) it stays off.
+  `refreshAgents()`. **Whenever the menu is visible with ≥ 1 item — the bare `@` included** —
+  `attachCustomKeyEventHandler` claims ↑ ↓ (move the highlight, wrapping), Tab and ↩ (insert the highlighted row) and
+  Esc (dismiss): preventDefault + return false, and the keypress/keyup twins are swallowed too, or Enter's keypress
+  would still send `\r` and submit Claude's prompt. Every other key (and ⌘/⌃/⌥ chords, Shift+Tab, IME composition)
+  passes through untouched. Claude Code's own `@` file picker opens below at the same time; it gets the arrows back
+  as soon as the prefix matches nothing (the menu hides) or after Esc (ours closes first; a second Esc reaches
+  Claude — which also means ours never sends Claude an ESC, its interrupt key). Accepting writes the rest of the
+  name/alias plus a space straight to the pty (`completionKeys`: just the tail for a prefix match, otherwise
+  backspaces and the full alias), so the CLI's own picker sees `@g6e ` and closes. Clicking a row inserts it the
+  same way. In a plain shell's alternate screen (vim, less) it stays off. Everything a pane writes to its pty goes
+  through one `send()`; in dev, `window.__paperPty = { on: true, writes: [] }` records it, which is how to prove
+  what reached the program (e.g. bare `@` + Down + Return writes only `"g6e "`, no `"\r"`).
 - **Anchoring.** Agent TUIs park the real cursor away from their input box, so `locateToken` finds the typed
   `@query` in the viewport (nearest the cursor) and falls back to the cursor. Cell size = `.xterm-screen` rect /
   cols×rows. The menu is a DOM sibling of `.term-host` in `.pane-body`, placed **above** the token's line (Claude
   draws its picker below) and flipped below near the top; re-placed on `onWriteParsed` via rAF. It is not
-  focusable and prevents mousedown, so xterm keeps focus.
+  focusable and cancels mousedown (`preventDefault`), so a click on a row neither blurs xterm nor starts a text or
+  terminal selection; the row's click then inserts it.
 - **Blue and violet tags.** `MentionHighlighter.setTargets(aliases, names)` paints registered `@alias`es blue and
   agent `@name`s violet (`MentionKind`, colour per kind; word boundary: not after a word char, so
   `ben@g6e` is left alone; a trailing `.` is punctuation) with xterm decorations (`registerMarker` +
@@ -1097,35 +1105,70 @@ Sessions started before this change keep acceleration until ⌘R. If xterm.js ev
 Claude switches to its `wheelFlood` path (3 lines for reports > 40 ms apart) and this needs revisiting.
 
 **Layer 2: the glide** (WebGL only; `new WebglAddon(true)` = preserveDrawingBuffer so the last frame can be copied
-at any time). While a scroll is in progress an opaque `canvas.paper-glide` (z-index 9, pointer-events none) over
-`.xterm-screen` shows content at a continuous position **P**; otherwise it is hidden (`display: none`, zero cost,
-pixel-exact text) and its two bitmaps are dropped 3 s later. Per frame it composites: fixed rows from the WebGL
-canvas (frame N, at content position F = rows shifted × row height); the scrolling region from N moved by F−P; and
-the revealed band from the previous composite O moved by P_O−P, so the band is real pixels, never blank. It draws
-inside `term.onRender` (same task as the WebGL draw, so it is never a frame late) and on rAF while P moves. Offsets
-are whole device pixels.
+at any time). While a scroll is in progress, **and while it rests off the row grid afterwards**, an opaque
+`canvas.paper-glide` (z-index 9, pointer-events none) over `.xterm-screen` shows content at a continuous position
+**P**; otherwise it is hidden (`display: none`, zero cost, pixel-exact text) and its two bitmaps are dropped 3 s
+later. Per frame it composites: fixed rows from the WebGL canvas (frame N, at content position F = rows shifted ×
+row height); the scrolling region from N moved by F−P; and the revealed band from the previous composite O moved by
+P_O−P, so the band is real pixels, never blank. It draws inside `term.onRender` (same task as the WebGL draw, so it
+is never a frame late) and on rAF while P moves. Offsets are whole device pixels.
+- **Whole frames (DEC 2026).** Claude redraws ~30 rows per scroll step, and a macOS pty hands that over in ~1 KB
+  reads, so xterm could render a frame half old, half new: a real tear, live and (worse) frozen into the glide's
+  region detection. Claude Code supports synchronized output but only asks for it after an XTVERSION reply, which
+  xterm.js never sends, so the Claude provider sets `CLAUDE_CODE_FORCE_SYNC_OUTPUT=1` (local launches; ignored
+  inside tmux, so remote panes are unchanged) and every frame arrives as `CSI ? 2026 h … CSI ? 2026 l`. xterm 5.5
+  ignores the pair; `lib/sync-output.ts` (`SyncOutput`, in front of `term.write` in TerminalPane) holds everything
+  between them and writes it to xterm as one chunk, which xterm parses in one go. Markers split across chunks are
+  carried; a frame without its ESU is released after 150 ms. Any other program that uses 2026 (Codex, nvim)
+  benefits too. Sessions started before this change get it on ⌘R.
 - **Region and shift.** Scrollback panes: `viewportY` (the whole screen). Mouse apps: `findShift` compares row text of
   the previous and new frame for shifts up to the rows still pending (+1), counting only rows that *changed* and now
   equal the shifted old row, so Claude's input box, rules, status line and its sticky prompt header (row 0 when
-  scrolled up) never join the region. `withChips`: a region-edge row carrying a chip, i.e. a run of cells with an
-  explicit background whose text was already there (Claude's "Jump to bottom (click) ↓" on the last transcript row),
-  joins the region and the chip is drawn fixed, from N, on top. Small in-region edits keep gliding. Edge rows that
-  changed leave the region; bigger changes (streaming) snap. Claude answers a report in ≈ 9 ms and draws ≈ 60 fps,
-  several rows per frame.
+  scrolled up) never join the region. The region then extends over rows that moved *and* were redrawn
+  (`editedInPlace`: same letters, or one a prefix of the other — the spinner line "✢ Vibing… (8s · ↓ 214 tokens)",
+  streamed text), so the spinner under the transcript scrolls with it. Small in-region edits keep gliding; an edge
+  row that changed into something else (the sticky header appearing) leaves the region; bigger changes (streaming)
+  snap. Claude answers a report in ≈ 9 ms and draws ≈ 60 fps, several rows per frame.
+- **Chips** (`withChips`, every shift and every in-region change): a run of 4…0.6·cols cells with an explicit
+  background, ≥ 3 characters, that did *not* travel with its row (its text is not the shifted source's text there),
+  while the rest of the row is that source, shifted (a chip that just appeared over moving content), or the run was
+  already in place last frame — Claude's "Jump to bottom (click) ↓" on the last transcript row. Its row joins the
+  region, the chip is drawn fixed from N on top, and `blankChips` paints every chip out of the band source O, or O's
+  copy would slide along with the content as a second chip. Full-width backgrounds (Claude's prompt rows) are content.
 - **Lead.** P's target is the finger (travel), clamped to [P_O, F]. Rows are requested *ahead* of the finger: ceil
   in the direction of travel, plus a look-ahead of finger speed × (1.25 × measured latency + 4 ms) for mouse apps
-  (10 ms for scrollback), capped at 1.2 rows, so frames are there before the finger needs them. Cost: a gesture can
-  end up to ~1 row past the finger's exact travel. A 2 px dead zone starts each gesture; a reversal needs 3 px.
+  (10 ms for scrollback), capped at 1.2 rows, so frames are there before the finger needs them. The app's row grid
+  can end up to ~1 row past the finger; the *content* does not (see Rest). A 2 px dead zone starts each gesture; a
+  reversal needs 3 px.
 - **Motion.** Critically damped spring, guarded so P never passes its target (no overshoot, no oscillation):
   `omegaTrack` 160 while following the finger, never faster than 1.3× the finger's speed (`catchUp`, so catching up
-  with a late frame is not a jump); `omegaGlide` 70 for notches; the gesture ends after 2 event intervals without
-  events (24–90 ms) and then settles on the grid with ω = speed/distance (clamped 60–140), an exponential that
-  starts at the current speed. A resumed gesture keeps its mapping and P never runs back toward a finger still moving
-  forward. Rows the app never answers (the top or bottom of its transcript) are forgotten after 260 ms.
-- **Cancels.** Any keydown, paste, mousedown, resize, buffer switch or mode change hides the overlay at once (the
-  real frame shows). The `.paper-mention-overlay` tags sit below the canvas, so they are covered during a glide and
-  are back (re-scanned) right after. Decorations are drawn by WebGL and glide with the text. `prefers-reduced-motion`,
-  `TUNING.glide = false` or no WebGL canvas: Layer 1 only (classic remainder carry).
+  with a late frame is not a jump); `omegaGlide` 70 for notches (a notch glides onto its rows and the overlay goes).
+  A resumed gesture keeps its mapping and P never runs back toward a finger still moving forward. Rows the app never
+  answers (the top or bottom of its transcript) are forgotten after 260 ms (the finger is re-anchored only while
+  the gesture is live).
+- **Rest — no snap at the end.** There is no settle onto the grid: Chromium wheel events carry no lift phase, so the
+  end of a gesture (2 event intervals without events, 24–90 ms) cannot be told from a finger pausing mid-row, and
+  any correction after it would be movement starting after a pause. The target stays the finger, so the content
+  rests exactly where it was left (`resting`: rAF stops, the overlay stays up and re-composites on every xterm
+  render, ≈ 0.2 ms each). Only if P is exactly on the grid does the overlay go. `retarget` (invisible, once per
+  gesture) then moves the app's grid to the first row boundary past P toward the end (reports or `scrollLines`), so
+  the live frame covers everything from there down — newest rows, spinner, chip — and the ≤ 1-row band is the top
+  sliver of older, settled transcript (from O, which cannot follow changes). Verified from the trace: after the last
+  wheel event P only moves in the gesture's direction, its speed never rises, it is still within 16–58 ms, and it
+  never starts again after a pause (`endcheck.js`-style analysis; the old settle moved 22–66 device px over ~125 ms,
+  sometimes speeding up again).
+- **Hit-testing at rest** (`onMouse`, window capture phase, so it runs before xterm's element and document
+  listeners): mousedown/up/move/click/dblclick/auxclick/contextmenu over the region get `clientY` (and `pageY`, `y`,
+  `offsetY`, …) moved by F−P onto the live frame's cell (clamped to the region), so selection, links, the mention-tag
+  link provider and the app's own mouse reports hit what is drawn; fixed rows and chips are where they look. A drag
+  that began in the pane is corrected until mouseup. `restShift()` exposes the offset; `MentionHighlighter.setShift`
+  uses it to lift the alternate-screen `.paper-mention-overlay` tags above the canvas (z 10) and move them with
+  their rows (hidden while the content moves, as before; normal-buffer decorations are drawn by WebGL and move with
+  the text anyway).
+- **Cancels.** Typed input (anything `onData` sends that is not a mouse or focus report), paste, resize (font change
+  included), buffer switch, mode change and a theme switch hide the overlay at once (the real frame shows, i.e. a
+  snap — these are explicit actions). Clicks, modifier keys, app shortcuts and tab switches do not.
+  `prefers-reduced-motion`, `TUNING.glide = false` or no WebGL canvas: Layer 1 only (classic remainder carry).
 
 **Knobs.** Prefs (`WidgetPrefs`, persisted in `state.json` → `widgets`, visible in `ui_state.widgets` and `state_get`):
 `scrollSensitivity` (default 1; the *Scroll speed* slider in the Widgets sheet, 0.5–3×) and `scrollNotchRows`
@@ -1141,7 +1184,19 @@ notch). Inactive tabs are `visibility: hidden`, so pick the pane whose `.xterm` 
 overlay itself to check pixels: Chromium then moves that canvas to the CPU and every later glide gets slow. Copy it into
 a scratch canvas first. Measured (M1-class, 2× DPR, 200×46 full-window pane): wheel handler 0.02–0.04 ms mean, ≤ 0.3 ms
 max (≈ 0.7 ms on the first event of a glide, which allocates the canvases); composite 0.005 ms CPU, 0.28 ms including
-the GPU; render hook 0.2 ms; frames hold 8.3 ms at 120 Hz.
+the GPU; render hook 0.2 ms (0.2–0.35 ms with chip detection); frames hold 8.3 ms at 120 Hz. Resting: no rAF, one
+composite per xterm render (≈ 1/s from a working Claude scrolled up).
+
+**Capturing frames (dev only).** `__paperScroll.probe = (session, f) => …` is called after every render and frame of
+an activation and when it hides (`ProbeFrame`: `kind`, the `gl` and `overlay` canvases, `visible`, `frameY`/`drawnY`,
+`rowH`, `region` with chip `patches`, N's row text). Copy both canvases 1:1 into a scratch canvas there (a scaled
+copy samples texel edges, which the two canvas types round differently — false diffs) and hash each device-pixel
+line in segments. A frame is right when: rows outside the region equal N; region rows equal N shifted by F−P
+(chip cells skipped where drawn and where their row came from); every row whose content is identifiable (the
+`seq` numbers, a numbered list) equals that content's pixels as last seen live, band included; no identifiable
+transcript row is held fixed while the region is offset; and the last composite before the overlay hides equals N.
+Run it while Claude works (a `sleep 1` loop) and while it streams a reply, near the bottom (spinner, counters, chip)
+and mid-transcript, for slow drags, flicks, reversals and notches, and for a few seconds at rest.
 
 ## Verifying a change — recipes
 
@@ -1212,6 +1267,29 @@ Codex accounts use the windows their own transcripts report (from the usage snap
   all-models week always show. Reset times are local, rounded to the minute ("resets Wed 11:00 PM · in 1d 10h").
 
 ## Gotchas
+
+- **Smooth-scroll rendering bugs fixed after real trackpad use** (all in the glide's composite; the live window was
+  always clean, which is the tell that a bug is in Layer 2):
+  - *Torn frames at the bottom of the transcript.* Claude's redraw arrived in several pty reads and xterm rendered
+    between them; the region detector then saw only the top part scrolled and held the rest fixed (a mixed row such
+    as "116. Gentle swells rock anchored bos to eat." and transcript rows drawn at F while their neighbours were at
+    P). Fix: DEC 2026 synchronized output, forced on for Claude and honoured by `SyncOutput` (see *Whole frames*).
+  - *The spinner line drawn twice.* "✢ Vibing… (8s · ↓ 214 tokens)" changes every frame, so it never equalled its
+    shifted source and stayed out of the region: drawn fixed from N while the row above was drawn shifted. Fix:
+    `editedInPlace` lets a moved-and-redrawn row join (and not leave) the region.
+  - *Two or three "Jump to bottom" chips, one sliding with the text.* Chip detection looked only at rows next to the
+    region (the chip row was usually inside it, unpatched, so the chip scrolled) and required the chip text to have
+    been there last frame (false on the frame it appears); and the band source O kept its own copy of the chip,
+    which showed through the hole the fixed chip leaves in N's shifted rows. Fix: the `withChips` rules above plus
+    `blankChips`.
+  - *A stretched or blank frame on a font change mid-glide.* The rAF tick composited a resized (cleared) WebGL canvas
+    into the old-sized overlay before xterm's render noticed. Fix: the tick checks the canvas sizes too. A theme
+    switch now cancels the glide (the band was in the old colours).
+  - Checked and not bugs: the WebGL canvas is fully opaque (alpha 255 everywhere, so the opaque 2D overlay shows
+    the same colours), region and band offsets are whole device pixels at 2× DPR, the fill colour for blanked chips
+    matches xterm's background pixels exactly, and preserveDrawingBuffer showed no visual side effect.
+- `CLAUDE_CODE_FORCE_SYNC_OUTPUT=1` is set by Paper's Claude provider *on purpose*: `shell-env.ts` scrubs the
+  `CLAUDE_CODE_*` Paper itself inherited, and the plan's `env` is applied after that, so the two do not conflict.
 
 - **Terminal queries are not kept for replay.** `sessions.ts` strips DA/DSR/XTVERSION/DECRQM/OSC-colour *queries*
   from the scrollback buffer (they still reach the pane live). A re-attaching pane replays the buffer into a fresh

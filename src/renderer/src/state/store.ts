@@ -40,8 +40,6 @@ export interface MentionState {
   /** How many leading entries of `matches` are agent names (the Agents section). */
   agents: number
   index: number
-  /** Passive: shown for discovery but not taking keys (a bare "@" in a terminal). */
-  passive: boolean
 }
 
 /** An agent callsign being edited, wherever the editor is (one at a time). */
@@ -760,7 +758,7 @@ export const useStore = create<State>((set, get) => ({
     const cur = get().mention
     if (!mention && !cur) return
     if (mention && cur && cur.owner === mention.owner && cur.query === mention.query && cur.index === mention.index &&
-      cur.passive === mention.passive && cur.agents === mention.agents && cur.matches.join() === mention.matches.join()) return
+      cur.agents === mention.agents && cur.matches.join() === mention.matches.join()) return
     set({ mention })
   },
 
