@@ -41,7 +41,7 @@ export interface PlanOptions {
   mcpUrl?: string
   /** The Paper session id, sent as X-Paper-Session so tools know who is calling (local only; no secret). */
   paperSession?: string
-  /** Claude only: extra settings JSON for `--settings` (the @mention hook, see hooks.ts). */
+  /** Claude only: extra settings JSON for `--settings` (wheel acceleration off, the @mention hook; see hooks.ts). */
   settings?: string
 }
 

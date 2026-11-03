@@ -15,7 +15,7 @@ import {
 import { MachineFailure, assertAlias, interactiveArgs, sshEnv } from './ssh'
 import { ensureTunnel, provisionRemoteSession, revokeRemoteSession } from './gateway'
 import { normaliseAgentName, pickName } from './names'
-import { localHookSettings, remoteHookSettings } from './hooks'
+import { localClaudeSettings, remoteClaudeSettings } from './hooks'
 import { getState } from './store'
 import {
   assertTmuxName, attachCommand, killRemote, launchRemote, readTags, remoteFileExists, remoteState, resolveRemoteDir, setTags,
@@ -439,7 +439,7 @@ export class SessionManager extends EventEmitter {
       systemPrompt: contextPrompt(meta, Boolean(mcpUrl)),
       mcpUrl,
       paperSession: meta.id,
-      settings: mcpUrl && meta.provider === 'claude' ? localHookSettings() : undefined
+      settings: meta.provider === 'claude' ? localClaudeSettings(Boolean(mcpUrl)) : undefined
     })
     meta.nativeSessionId = plan.nativeSessionId || meta.nativeSessionId
     if (plan.transcriptPath) meta.transcriptPath = plan.transcriptPath
@@ -550,7 +550,7 @@ export class SessionManager extends EventEmitter {
         mcpConfig: tools.mcpConfig,
         systemPrompt: contextPrompt(meta, Boolean(tools.mcpConfig)),
         // The hook reads the gateway token from that same config, so it only makes sense with one.
-        settings: tools.mcpConfig && tools.hook ? remoteHookSettings() : undefined
+        settings: meta.provider === 'claude' ? remoteClaudeSettings(Boolean(tools.mcpConfig && tools.hook)) : undefined
       })
       const nativeId = plan.nativeSessionId || meta.nativeSessionId
       const result = await launchRemote({

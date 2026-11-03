@@ -52,8 +52,19 @@ exit 0
 /** Where the script lives on a machine, next to the session MCP configs (dir 0700). */
 export const REMOTE_SCRIPT = '~/.paper/run/paper-mention.sh'
 
-function settingsFor(command: string): string {
-  return JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command, timeout: 5 }] }] } })
+/**
+ * Settings Paper gives every Claude session, merged with the user's own.
+ * `wheelScrollAccelerationEnabled: false` (verified on 2.1.317: a settings
+ * key, "Ramp mouse-wheel scroll speed during fast scrolls (fullscreen mode
+ * only)"): Paper's smooth scrolling already sends one wheel report per row of
+ * finger travel and its velocity comes from the OS momentum stream, so
+ * Claude's own ramp on top would overshoot. With it off, k reports = k lines.
+ */
+const CLAUDE_SETTINGS = { wheelScrollAccelerationEnabled: false }
+
+function settingsFor(command?: string): string {
+  const hooks = command ? { hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command, timeout: 5 }] }] } } : {}
+  return JSON.stringify({ ...CLAUDE_SETTINGS, ...hooks })
 }
 
 const localScript = (): string => join(PAPER_HOME, 'hooks', 'paper-mention.sh')
@@ -73,19 +84,20 @@ function ensureLocalScript(): string {
   return path
 }
 
-/** `--settings` JSON for a local Claude session, or undefined if the script cannot be written. */
-export function localHookSettings(): string | undefined {
+/** `--settings` JSON for a local Claude session; the @mention hook only with `hook` (and a writable script). */
+export function localClaudeSettings(hook: boolean): string {
+  if (!hook) return settingsFor()
   try {
     return settingsFor(`sh ${shq(ensureLocalScript())}`)
   } catch (err) {
     console.warn('[hooks] could not write the mention hook:', (err as Error).message)
-    return undefined
+    return settingsFor()
   }
 }
 
-/** `--settings` JSON for a Claude session on a machine (the script is uploaded by `ensureRemoteScript`). */
-export function remoteHookSettings(): string {
-  return settingsFor('sh "$HOME/.paper/run/paper-mention.sh"')
+/** `--settings` JSON for a Claude session on a machine (the hook script is uploaded by `ensureRemoteScript`). */
+export function remoteClaudeSettings(hook: boolean): string {
+  return settingsFor(hook ? 'sh "$HOME/.paper/run/paper-mention.sh"' : undefined)
 }
 
 /** Aliases whose script this process already uploaded (the script only changes with Paper's code). */

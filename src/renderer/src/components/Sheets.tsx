@@ -137,6 +137,18 @@ export function WidgetSheet(): JSX.Element {
           onChange={(e) => setWidgets({ ...widgets, petName: e.target.value })}
         />
       </div>
+      <div className="widget-pet">
+        <span className="label">Scroll speed · {(widgets.scrollSensitivity ?? 1).toFixed(1)}×</span>
+        <input
+          type="range"
+          className="scroll-speed"
+          min={0.5}
+          max={3}
+          step={0.1}
+          value={widgets.scrollSensitivity ?? 1}
+          onChange={(e) => setWidgets({ ...widgets, scrollSensitivity: Number(e.target.value) })}
+        />
+      </div>
     </Modal>
   )
 }

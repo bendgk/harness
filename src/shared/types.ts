@@ -313,6 +313,10 @@ export interface DirComplete {
 export interface WidgetPrefs {
   enabled: string[]
   petName: string
+  /** Terminal scroll speed multiplier (smooth scrolling; default 1). */
+  scrollSensitivity?: number
+  /** Rows per notch of a notched mouse wheel (default 3). */
+  scrollNotchRows?: number
 }
 
 export interface SpawnRequest {

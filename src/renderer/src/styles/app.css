@@ -556,6 +556,7 @@
 .widget-name { font-size: 12px; color: var(--ink); }
 .widget-note { font-size: 10.5px; color: var(--ink-faint); }
 .widget-pet { padding: 10px 16px 14px; border-top: 1px solid var(--rule); display: flex; flex-direction: column; gap: 6px; }
+.scroll-speed { width: 100%; accent-color: var(--accent); }
 
 /* --------------------------------------------------------- transients -- */
 .handoff {

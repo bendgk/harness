@@ -11,6 +11,7 @@ import MentionMenu, { menuHeight } from './MentionMenu'
 import { MentionHighlighter, MentionTracker, locateToken, type MentionKind } from '../lib/term-mentions'
 import { completionKeys } from '../lib/machines'
 import { agentSummaries, knownAgentNames, mentionTargets } from '../lib/agents'
+import { SmoothScroll, TUNING, type ScrollTraceRecord } from '../lib/smooth-scroll'
 import type { ProviderId } from '@shared/types'
 
 const api = window.paper
@@ -38,6 +39,38 @@ export interface TerminalHandle {
 const MENTION_COLORS: Record<'day' | 'night', Record<MentionKind, { fg: string; bg: string }>> = {
   day: { machine: { fg: '#2a5fae', bg: '#e1e9f5' }, agent: { fg: '#6a48a8', bg: '#ebe5f5' } },
   night: { machine: { fg: '#9cc3f3', bg: '#1d2836' }, agent: { fg: '#c4b0f2', bg: '#261f36' } }
+}
+
+/**
+ * Dev-only handle on every pane's scroller and its trace, for measuring
+ * smoothness from ui_eval: `__paperScroll.trace.on = true`, replay wheel
+ * events, then read `__paperScroll.trace.records`. See CLAUDE.md, *Smooth scrolling*.
+ */
+interface DevScroll {
+  panes: Map<string, { term: Terminal; scroller: SmoothScroll }>
+  tuning: typeof TUNING
+  trace: { on: boolean; max: number; records: (ScrollTraceRecord & { session: string })[] }
+  push: (session: string, r: ScrollTraceRecord) => void
+}
+function devScroll(): DevScroll | null {
+  if (!import.meta.env.DEV) return null
+  const w = window as unknown as { __paperScroll?: DevScroll }
+  if (!w.__paperScroll) {
+    const d: DevScroll = {
+      panes: new Map(),
+      tuning: TUNING,
+      trace: { on: false, max: 20000, records: [] },
+      push: (session, r) => {
+        if (!d.trace.on) return
+        d.trace.records.push({ session, ...r })
+        if (d.trace.records.length > d.trace.max) d.trace.records.splice(0, d.trace.records.length - d.trace.max)
+      }
+    }
+    w.__paperScroll = d
+  }
+  // HMR swaps the module: point at the live knobs.
+  w.__paperScroll.tuning = TUNING
+  return w.__paperScroll
 }
 
 /** Where the dropdown sits, in pane-body pixels. */
@@ -98,8 +131,10 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
 
     // GPU rendering keeps long agent streams smooth; fall back silently if the
     // context is lost (external display changes, GPU switch on Apple silicon).
+    // preserveDrawingBuffer: the smooth-scroll glide copies the last frame at
+    // any time, not only inside xterm's render.
     try {
-      const webgl = new WebglAddon()
+      const webgl = new WebglAddon(true)
       webgl.onContextLoss(() => webgl.dispose())
       term.loadAddon(webgl)
     } catch {
@@ -122,6 +157,17 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       } catch { /* pane is hidden or mid-teardown */ }
     }
     sendResize()
+
+    // ---- smooth scrolling (lib/smooth-scroll.ts) ------------------------------
+    const scroller = new SmoothScroll(term, {
+      write: (d) => void api.session.write(sessionId, d),
+      sensitivity: () => useStore.getState().widgets.scrollSensitivity ?? 1,
+      notchRows: () => useStore.getState().widgets.scrollNotchRows ?? 3,
+      // Claude Code drops the first wheel report after a direction change.
+      dropsFlipReport: () => provider === 'claude',
+      trace: import.meta.env.DEV ? (r) => devScroll()?.push(sessionId, r) : undefined
+    })
+    if (import.meta.env.DEV) devScroll()?.panes.set(sessionId, { term, scroller })
 
     // ---- @-mention autocomplete -------------------------------------------
     // The tracker watches keystrokes on their way to the pty; while it holds a
@@ -166,16 +212,20 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     acceptRef.current = accept
 
     const disposeData = term.onData((d) => {
+      // Wheel reports the scroller is batching into one write.
+      if (scroller.capture(d)) return
       void api.session.write(sessionId, d)
       tracker.feed(d)
       if (tracker.query !== null || mine()) refresh()
     })
-    const disposeBinary = term.onBinary((d) => void api.session.write(sessionId, d))
+    const disposeBinary = term.onBinary((d) => { if (!scroller.capture(d)) void api.session.write(sessionId, d) })
 
     // keydown is acted on; its keypress/keyup twins are swallowed too, or
     // Enter's keypress would still reach the program as a carriage return.
     let swallow: string | null = null
     term.attachCustomKeyEventHandler((ev) => {
+      // Typing shows the real frame at once.
+      if (ev.type === 'keydown') scroller.cancel('key')
       if (swallow && ev.key === swallow && ev.type !== 'keydown') {
         if (ev.type === 'keyup') swallow = null
         return false
@@ -206,11 +256,13 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     })
 
     // A click can move the cursor anywhere, and leaving the pane abandons the token.
-    const onMouse = (): void => close(false)
+    const onMouse = (): void => { scroller.cancel('mouse'); close(false) }
     host.addEventListener('mousedown', onMouse)
     const textarea = term.textarea
     const onBlur = (): void => close(false)
     textarea?.addEventListener('blur', onBlur)
+    const onPaste = (): void => scroller.cancel('paste')
+    textarea?.addEventListener('paste', onPaste)
 
     // ---- @alias (blue) and @agent (violet) tags -----------------------------
     // Clicking a machine opens its details; clicking an agent goes to it,
@@ -283,6 +335,9 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       cancelAnimationFrame(raf)
       host.removeEventListener('mousedown', onMouse)
       textarea?.removeEventListener('blur', onBlur)
+      textarea?.removeEventListener('paste', onPaste)
+      scroller.dispose()
+      if (import.meta.env.DEV && devScroll()?.panes.get(sessionId)?.scroller === scroller) devScroll()?.panes.delete(sessionId)
       highlighter.dispose()
       highlightRef.current = null
       if (mine()) store().setMention(null)

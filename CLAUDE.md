@@ -58,14 +58,15 @@ src/main/menu.ts         Application menu = the single source of shortcuts; send
 src/main/mcp.ts          MCP server (Streamable HTTP, stateless) over the tool registry; GET /agents/brief.
 src/main/names.ts        Agent callsigns: the name pool, validation, pickName. See *Agent callsigns & awareness*.
 src/main/agents.ts       agents_list / agent_info / agent_transcript / the @mention brief, from memory.
-src/main/hooks.ts        The Claude UserPromptSubmit @mention hook (script + --settings JSON, local and remote).
+src/main/hooks.ts        Claude's --settings JSON (wheel acceleration off + the UserPromptSubmit @mention hook script),
+                         local and remote.
 src/main/tools/          THE TOOL REGISTRY. types.ts (contract), app/sessions/ui/dev/state/machines.ts (tools),
                          index.ts (list), runtime.ts (validate+invoke), context.ts (binds live services).
 src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage,handoff,machines,tools,on*}.
 src/renderer/src/        React + zustand UI. state/store.ts is the app store (HMR-safe, exposed as
                          window.__paper); state/tree.ts is the pane-tree algebra; components/*, widgets/*;
                          lib/machines.ts, lib/agents.ts, lib/term-mentions.ts, lib/dev-fakes.ts (see *Machines
-                         in the UI* and *Agent callsigns in the UI*).
+                         in the UI* and *Agent callsigns in the UI*); lib/smooth-scroll.ts (see *Smooth scrolling*).
 src/shared/              Types and pricing used by both sides.
 scripts/sync-tools.mjs   Regenerates the Tools section of this file from the registry.
 ```
@@ -457,7 +458,9 @@ or a unique ≥8-char prefix; an unknown name errors with the list of known ones
 `listAgents({ includeExited: true })`.
 
 **The @mention hook (Claude only)** (`src/main/hooks.ts`). Local and remote Claude sessions get
-`--settings '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"sh <script>","timeout":5}]}]}}'`.
+`--settings '{"wheelScrollAccelerationEnabled":false,"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"sh <script>","timeout":5}]}]}}'`
+(`localClaudeSettings(hook)` / `remoteClaudeSettings(hook)`; without Paper tools — `PAPER_MCP=0`, or a remote session
+whose gateway failed — the hooks part is left out but the acceleration key stays: see *Smooth scrolling*).
 Verified on Claude Code 2.1.317: `--settings <file-or-json>` *adds* a settings source — the user's, project and
 local hooks still run alongside it (tested with a project `UserPromptSubmit` hook plus a `--settings` one: both
 reached the model) — and on exit 0 a `UserPromptSubmit` hook's plain stdout is added to the context before the
@@ -1059,6 +1062,86 @@ without spending quota:
 ```
 session_spawn { provider: 'shell' }  →  ui_eval { code: "__paperFakes.agentify('<id>', { status: 'working', name: 'euclid' })" }
 ```
+
+## Smooth scrolling
+
+`src/renderer/src/lib/smooth-scroll.ts`, one `SmoothScroll` per `TerminalPane`. The goal is "moving paper
+underneath": content follows a Mac trackpad 1:1, momentum included, with no row-by-row jumps. It has two layers.
+
+**Layer 1: faithful input.** `term.attachCustomWheelEventHandler` takes every wheel event (return false +
+preventDefault, so neither xterm nor the hidden `.xterm-viewport` scrolls). Pixel deltas (LINE/PAGE converted) ×
+`scrollSensitivity` accumulate per pane and become one row per row height of travel. xterm itself sends **one** report
+per DOM event in mouse mode, whatever the delta (−120 px → 1 report at 19.5 px rows); Paper sends k for k rows.
+macOS momentum is just more wheel events and is followed 1:1; Paper adds no physics of its own. Modes:
+- **mouse tracking** (`term.modes.mouseTrackingMode` vt200/drag/any, i.e. Claude Code 2.1.x fullscreen, vim mouse=a):
+  k reports through xterm's own encoder (`_core.coreMouseService.triggerMouseEvent`, so SGR/URXVT/X10-default/pixel
+  encodings all work) at the pointer's cell. `TerminalPane`'s onData/onBinary hand them to `scroller.capture()`,
+  and they go to the pty as **one** write. Without the private service, xterm's default is kept.
+- **normal buffer** (shells, remote tmux panes): `term.scrollLines(k)`.
+- **alternate screen without mouse tracking** (less, vim mouse off) and X10: untouched (xterm sends arrow keys).
+- ctrl+wheel (pinch zoom) and shift+wheel (horizontal) keep their defaults.
+
+**Notched wheels** (`isNotch`): deltaMode LINE/PAGE, or Chromium's `wheelDeltaY` a nonzero multiple of 120 with
+|deltaY| ≥ 16 (Windows ≈ 100 per notch at 100 %, macOS mice 40 per tick), **unless** a smooth-looking event (|deltaY| <
+16, or wheelDelta not a multiple of 120 — mac trackpads report −3·deltaY, Windows precision touchpads −1.2·deltaY) came
+in the last 400 ms. A notch is `scrollNotchRows` rows (default 3) × sensitivity, glided by Layer 2; precision touchpads
+behave like the Mac trackpad. Known false positive: a trackpad gesture whose *first* event is exactly 40/80/… px is
+read as one notch (3 rows), then the stream is smooth.
+
+**Claude Code's own wheel handling** (read from the 2.1.317 binary, function `oNt`): with `TERM_PROGRAM=Paper` and
+xterm.js answering no XTVERSION, Claude uses its "native window" path, base 1 line per report. Paper turns
+`wheelScrollAccelerationEnabled` off in the `--settings` it passes to every Claude launch, local and remote, so k reports
+= k lines exactly (without that, 1:1 reports plus Claude's ramp overshoot). Claude also **drops the first report after
+a direction change** (flip debounce), so Paper sends one extra on each reversal (`dropsFlipReport`, Claude panes only).
+Sessions started before this change keep acceleration until ⌘R. If xterm.js ever answers XTVERSION with "xterm.js…",
+Claude switches to its `wheelFlood` path (3 lines for reports > 40 ms apart) and this needs revisiting.
+
+**Layer 2: the glide** (WebGL only; `new WebglAddon(true)` = preserveDrawingBuffer so the last frame can be copied
+at any time). While a scroll is in progress an opaque `canvas.paper-glide` (z-index 9, pointer-events none) over
+`.xterm-screen` shows content at a continuous position **P**; otherwise it is hidden (`display: none`, zero cost,
+pixel-exact text) and its two bitmaps are dropped 3 s later. Per frame it composites: fixed rows from the WebGL
+canvas (frame N, at content position F = rows shifted × row height); the scrolling region from N moved by F−P; and
+the revealed band from the previous composite O moved by P_O−P, so the band is real pixels, never blank. It draws
+inside `term.onRender` (same task as the WebGL draw, so it is never a frame late) and on rAF while P moves. Offsets
+are whole device pixels.
+- **Region and shift.** Scrollback panes: `viewportY` (the whole screen). Mouse apps: `findShift` compares row text of
+  the previous and new frame for shifts up to the rows still pending (+1), counting only rows that *changed* and now
+  equal the shifted old row, so Claude's input box, rules, status line and its sticky prompt header (row 0 when
+  scrolled up) never join the region. `withChips`: a region-edge row carrying a chip, i.e. a run of cells with an
+  explicit background whose text was already there (Claude's "Jump to bottom (click) ↓" on the last transcript row),
+  joins the region and the chip is drawn fixed, from N, on top. Small in-region edits keep gliding. Edge rows that
+  changed leave the region; bigger changes (streaming) snap. Claude answers a report in ≈ 9 ms and draws ≈ 60 fps,
+  several rows per frame.
+- **Lead.** P's target is the finger (travel), clamped to [P_O, F]. Rows are requested *ahead* of the finger: ceil
+  in the direction of travel, plus a look-ahead of finger speed × (1.25 × measured latency + 4 ms) for mouse apps
+  (10 ms for scrollback), capped at 1.2 rows, so frames are there before the finger needs them. Cost: a gesture can
+  end up to ~1 row past the finger's exact travel. A 2 px dead zone starts each gesture; a reversal needs 3 px.
+- **Motion.** Critically damped spring, guarded so P never passes its target (no overshoot, no oscillation):
+  `omegaTrack` 160 while following the finger, never faster than 1.3× the finger's speed (`catchUp`, so catching up
+  with a late frame is not a jump); `omegaGlide` 70 for notches; the gesture ends after 2 event intervals without
+  events (24–90 ms) and then settles on the grid with ω = speed/distance (clamped 60–140), an exponential that
+  starts at the current speed. A resumed gesture keeps its mapping and P never runs back toward a finger still moving
+  forward. Rows the app never answers (the top or bottom of its transcript) are forgotten after 260 ms.
+- **Cancels.** Any keydown, paste, mousedown, resize, buffer switch or mode change hides the overlay at once (the
+  real frame shows). The `.paper-mention-overlay` tags sit below the canvas, so they are covered during a glide and
+  are back (re-scanned) right after. Decorations are drawn by WebGL and glide with the text. `prefers-reduced-motion`,
+  `TUNING.glide = false` or no WebGL canvas: Layer 1 only (classic remainder carry).
+
+**Knobs.** Prefs (`WidgetPrefs`, persisted in `state.json` → `widgets`, visible in `ui_state.widgets` and `state_get`):
+`scrollSensitivity` (default 1; the *Scroll speed* slider in the Widgets sheet, 0.5–3×) and `scrollNotchRows`
+(default 3, no UI: `ui_eval` `setWidgets`). Tuning constants: `TUNING` in smooth-scroll.ts.
+
+**Measuring it (dev only).** `window.__paperScroll`: `panes` (sessionId → `{ term, scroller }`; `scroller.stats()`),
+`tuning` (live `TUNING`), `trace` (`on`, `records`). With `trace.on = true` every wheel event, render and frame is
+recorded: rows/reports sent, detected shift and region, `v` = F−P, `pos` = P (the effective content position, rows
+shifted × rowH − v; continuous across activations), handler cost `ms`. Replay gestures by dispatching
+`new WheelEvent('wheel', { deltaY, clientX, clientY, bubbles: true, cancelable: true })` on `.xterm-screen` once per
+animation frame, with `Object.defineProperty(ev, 'wheelDeltaY', { value })` (−3·deltaY for a mac trackpad, ∓120 for a
+notch). Inactive tabs are `visibility: hidden`, so pick the pane whose `.xterm` is visible. Never `getImageData` the
+overlay itself to check pixels: Chromium then moves that canvas to the CPU and every later glide gets slow. Copy it into
+a scratch canvas first. Measured (M1-class, 2× DPR, 200×46 full-window pane): wheel handler 0.02–0.04 ms mean, ≤ 0.3 ms
+max (≈ 0.7 ms on the first event of a glide, which allocates the canvases); composite 0.005 ms CPU, 0.28 ms including
+the GPU; render hook 0.2 ms; frames hold 8.3 ms at 120 Hz.
 
 ## Verifying a change — recipes
 
