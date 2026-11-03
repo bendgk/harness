@@ -63,6 +63,39 @@ export interface SessionMeta {
   }
   /** Set when this session was brought back after Paper restarted. */
   restoredAt?: number
+  /**
+   * Agent callsign, e.g. "euclid" (see src/main/names.ts). Agents only — shells
+   * have none. Unique across live sessions and machine aliases; `@euclid`
+   * mentions resolve to it. Follows the session through handoffs and restarts.
+   */
+  name?: string
+}
+
+/**
+ * What another agent is doing, cheap enough to list on every mention: built
+ * from the transcript Paper already tails for usage (local file or the
+ * mirrored copy of a remote one), held in memory, never a model call.
+ */
+export interface AgentSummary {
+  name: string
+  sessionId: string
+  host: string
+  provider: AgentProviderId
+  /** 'detached' = running on a machine but not attached to this Paper (adoptable). */
+  status: SessionStatus | 'detached'
+  title: string
+  cwd: string
+  /** Last output from the agent (epoch ms). */
+  lastActiveAt?: number
+  /** One line on what it is doing now: open todo, last tool call, or last ask. */
+  doing?: string
+  /** The latest user prompt, truncated. */
+  lastPrompt?: string
+  /** The latest assistant text, truncated. */
+  lastReply?: string
+  /** Open todo items from the agent's own todo list (Claude TodoWrite), if any. */
+  todos?: { text: string; status: 'pending' | 'in_progress' | 'completed' }[]
+  attached: boolean
 }
 
 /** Sentinel host for "this computer". Reserved: no Machine may use it as its alias. */
@@ -256,6 +289,8 @@ export interface SpawnRequest {
   prompt?: string
   /** Where to run the CLI: LOCAL_HOST (default) or a registered machine alias. */
   host?: string
+  /** Agent callsign to use instead of an auto-picked one (validated, must be free). */
+  name?: string
 }
 
 /**
@@ -263,13 +298,15 @@ export interface SpawnRequest {
  * Remote launches tag their tmux session with user options so this can be
  * read back without trusting Paper's own memory:
  *   @paper_id (Paper session id), @paper_provider, @paper_native (conversation id),
- *   @paper_cwd, @paper_title (best-effort, may lag)
+ *   @paper_cwd, @paper_title (best-effort, may lag), @paper_name (agent callsign)
  * on the private socket `tmux -L paper`, session names `paper-<12 hex>`.
  */
 export interface HostedAgent {
   tmux: string
   /** Paper session id from @paper_id; may not be live in this Paper (adoptable). */
   sessionId?: string
+  /** Agent callsign from @paper_name. */
+  name?: string
   provider?: ProviderId
   nativeSessionId?: string
   cwd?: string

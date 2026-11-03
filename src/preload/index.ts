@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
-  Account, AgentProviderId, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, MachineInventory, MachineProbe, SessionMeta,
+  Account, AgentProviderId, AgentSummary, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, MachineInventory, MachineProbe, SessionMeta,
   SpawnRequest, Tab, ToolManifestEntry, ToolResult, UsageSnapshot, WidgetPrefs
 } from '@shared/types'
 
@@ -57,7 +57,9 @@ const api = {
     restart: (id: string) => invoke<void>('session:restart', id),
     rename: (id: string, title: string) => invoke<SessionMeta>('session:rename', id, title),
     close: (id: string) => invoke<void>('session:close', id),
-    retarget: (id: string, cwd: string) => invoke<void>('session:retarget', id, cwd)
+    retarget: (id: string, cwd: string) => invoke<void>('session:retarget', id, cwd),
+    /** Give an agent a different callsign (validated; must not clash with an agent or machine). */
+    setName: (id: string, name: string) => invoke<SessionMeta>('session:setName', id, name)
   },
 
   usage: {
@@ -69,6 +71,11 @@ const api = {
     switchAccount: (sessionId: string, accountId: string) => invoke<void>('handoff:switch', sessionId, accountId),
     /** Move a session's agent to another computer (or back to LOCAL_HOST), conversation intact. */
     toMachine: (req: MachineHandoffRequest) => invoke<void>('handoff:machine', req)
+  },
+
+  /** Every named agent, local and on machines (live + detached), with what it is doing. Cheap. */
+  agents: {
+    list: () => invoke<AgentSummary[]>('agents:list')
   },
 
   /** Remote computers agents may ssh into or be moved to (ssh host aliases). */
