@@ -47,6 +47,13 @@
  * trailing a staircase. While tracking, P never moves faster than 1.3× the
  * finger, even catching up with a late frame.
  *
+ * The model corrects itself every frame (`reconcile`): rows are owed only
+ * until a shift answers them; rows the app does not answer (it is at its end
+ * or start — Claude ignores reports past its bottom) are dropped within a
+ * stall window, the finger's overscroll with them, and a finger still pushing
+ * there pins the edge (nothing more is sent that way until it reverses).
+ * Nothing a rest used to clear can go stale.
+ *
  * No snap at the end: when the gesture ends the target stays the finger, so
  * the content rests exactly where it was left, off the row grid if need be
  * (`resting`: rAF stops, the overlay stays and re-composites on each render).
@@ -77,8 +84,21 @@ export const TUNING = {
    */
   idleMinMs: 24,
   idleMaxMs: 90,
-  /** Reports the app has not answered with a shift by then are dropped (top/bottom of its transcript). */
-  pendingMs: 260,
+  /**
+   * Rows asked for that nothing has answered (not one shift that way) for this long are not owed: the app is at
+   * its end or its start, or it answered fewer than asked. They are dropped, every frame, so the model can never
+   * drift from what the app shows (see `reconcile`). At least this many ms, 1.5× the slowest recent answer + a
+   * frame (Claude answers in ≈ 9–29 ms idle, up to ≈ 76 ms while streaming), and 6 of our own frames; at most
+   * `stallMaxMs`.
+   */
+  stallMs: 80,
+  stallMaxMs: 250,
+  /** Toward an end the app's screen shows (`atEnd`), rows are not owed after this (or two of our frames). */
+  endMs: 34,
+  /** Safety net: no row is owed longer than this, whatever else shifts meanwhile. */
+  owedMaxMs: 1500,
+  /** A shift that arrives this soon after its rows were dropped is a late answer, not new content. */
+  lateMs: 500,
   /** Movement before a gesture requests its first row (a resting finger's jitter does not scroll). */
   deadPx: 2,
   /** Movement against the direction of travel before it counts as a reversal. */
@@ -104,6 +124,17 @@ export interface SmoothScrollOptions {
    * Code's flip debounce, 2.1.x): send one extra so reversals are not short.
    */
   dropsFlipReport: () => boolean
+  /**
+   * Output from the app is on its way to the screen (a DEC 2026 frame being held, or writes xterm has not
+   * parsed yet). An answer may be in it, so a stall is never judged then.
+   */
+  outputPending?: () => boolean
+  /**
+   * What the app's own screen says about where it is: +1 at its end, −1 at its start, 0 otherwise or unknown
+   * (Claude Code: no "Jump to bottom" chip and no sticky prompt header = its sticky bottom). Rows still owed
+   * toward an end the screen shows are dropped within two frames; output growing there is not an answer.
+   */
+  atEnd?: (rows: string[]) => number
   /**
    * The resting offset changed (a glide came to rest off the row grid, the
    * region or offset changed while resting, or the overlay went away): DOM
@@ -138,7 +169,7 @@ type Mode = 'report' | 'scrollback' | 'native'
 
 export interface ScrollTraceRecord {
   t: number
-  kind: 'wheel' | 'render' | 'tick' | 'snap' | 'retarget' | 'rest'
+  kind: 'wheel' | 'render' | 'tick' | 'snap' | 'retarget' | 'rest' | 'boundary'
   mode: Mode
   /** Rows requested so far in this activation (scrollback: absolute viewport row). */
   sent: number
@@ -166,7 +197,13 @@ export interface ScrollTraceRecord {
 /** Cells [c0, c1] of a row that stay put while the rest of the row scrolls. */
 interface Patch { row: number; c0: number; c1: number }
 
-interface Region { top: number; bot: number; patches?: Patch[] }
+interface Region {
+  top: number
+  bot: number
+  patches?: Patch[]
+  /** A chip appeared in this very frame (it was not there last frame). */
+  fresh?: boolean
+}
 
 const WHEEL_BUTTON = 4 // CoreMouseButton.WHEEL
 const MOUSE_EVENTS = ['mousedown', 'mouseup', 'mousemove', 'click', 'dblclick', 'auxclick', 'contextmenu'] as const
@@ -200,12 +237,21 @@ export function editedInPlace(a: string, b: string): boolean {
   return la.length >= 4 && la === tb.replace(/[^\p{L}]+/gu, '')
 }
 
-export function findShift(prev: string[], next: string[], maxS: number): { s: number; top: number; bot: number } | null {
+export function findShift(prev: string[], next: string[], maxS: number, limits?: Readonly<Record<number, number>>): { s: number; top: number; bot: number } | null {
   const n = Math.min(prev.length, next.length)
-  let best: { s: number; score: number; first: number; last: number } | null = null
+  let best: { s: number; score: number; weight: number; first: number; last: number } | null = null
+  // A row whose text the frame has k times is 1/k of a row of evidence: in a transcript that repeats itself
+  // (the same prompt and reply block many times) a shift by a multiple of the block matches those rows as
+  // well as the true one, and only the rows that are unique tell them apart.
+  const seen = new Map<string, number>()
+  for (let r = 0; r < n; r++) seen.set(prev[r], (seen.get(prev[r]) ?? 0) + 1)
+  // Only as far as rows are owed each way (`limits`, by direction): otherwise a shift the other way, or too
+  // far, can match as well as the true one.
   for (const dir of [1, -1]) {
-    for (let s = 1; s <= Math.min(maxS, n - 2); s++) {
+    const lim = limits ? limits[dir] ?? 0 : maxS
+    for (let s = 1; s <= Math.min(lim, n - 2); s++) {
       let score = 0
+      let weight = 0
       let first = -1
       let last = -1
       for (let r = 0; r < n; r++) {
@@ -214,11 +260,12 @@ export function findShift(prev: string[], next: string[], maxS: number): { s: nu
         const line = next[r]
         if (line === prev[src] && line !== prev[r] && line.trim() !== '') {
           score++
+          weight += 1 / (seen.get(line) ?? 1)
           if (first < 0) first = r
           last = r
         }
       }
-      if (score > (best?.score ?? 0)) best = { s: dir * s, score, first, last }
+      if (weight > (best?.weight ?? 0) + 1e-9 || (best && Math.abs(weight - best.weight) <= 1e-9 && score > best.score)) best = { s: dir * s, score, weight, first, last }
     }
   }
   if (!best || best.score < 2) return null
@@ -240,9 +287,13 @@ export function findShift(prev: string[], next: string[], maxS: number): { s: nu
   let { first, last } = best
   while (first > 0 && fits(first - 1)) first--
   while (last < n - 1 && fits(last + 1)) last++
-  // Add the rows that scrolled into view on the leading side.
-  const top = dir > 0 ? first : Math.max(0, first + s)
-  const bot = dir > 0 ? Math.min(n - 1, last + s) : last
+  // Add the rows that scrolled into view on the leading side — but a row there that did not change at all is
+  // chrome, not content arriving (Claude's sticky header at row 0, when the row scrolling in under it happens to
+  // be the same prompt).
+  let top = dir > 0 ? first : Math.max(0, first + s)
+  let bot = dir > 0 ? Math.min(n - 1, last + s) : last
+  if (dir < 0) while (top < first && next[top] === prev[top] && next[top].trim() !== '') top++
+  else while (bot > last && next[bot] === prev[bot] && next[bot].trim() !== '') bot--
   return { s, top, bot }
 }
 
@@ -265,6 +316,13 @@ export class SmoothScroll {
   private holdDir = 0
   private extreme = 0
   private lastReportDir = 0
+  /**
+   * The app's end (+1) or start (−1) the finger is pushing against, as the frames proved it (`reconcile`): no
+   * rows are sent that way until the finger reverses. Kept across gestures while the screen is unchanged
+   * (`edgeKey`), so a second push at the bottom sends nothing either; any change (new output, typing) re-probes.
+   */
+  private edge = 0
+  private edgeKey = ''
   private capturing: string[] | null = null
   private lastNotch = false
   /** Recent interval between wheel events (ms, EWMA). */
@@ -278,8 +336,23 @@ export class SmoothScroll {
   private origin = 0
   private sent = 0
   private shown = 0
+  /** Rows asked for and not yet seen shifted: signed sum, and sum of magnitudes (both derived from `owed`). */
   private pending = 0
   private pendingAbs = 0
+  /** Every send not yet answered, oldest first (signed rows, send time): each shift answers the oldest that way. */
+  private owed: { t: number; n: number }[] = []
+  /** When a shift last answered rows going up (−1) and going down (+1). */
+  private answered: Record<number, number> = { [-1]: -Infinity, [1]: -Infinity }
+  /** Slowest recent wait for a shift (ms, decaying max): sizes the stall window. */
+  private answerMs = 30
+  /** Our own frame interval (ms, EWMA): a starved renderer sees answers late, so the window stretches with it. */
+  private frameMs = 8
+  /** Last time xterm parsed output and last time it rendered: parsed but not yet drawn is still in flight. */
+  private parsedAt = 0
+  private renderedAt = 0
+  /** Rows the last stall dropped (signed) and when: a shift that still comes for them is a late answer, not content. */
+  private forgiven = 0
+  private forgivenAt = -Infinity
   private lastSendAt = 0
   /** Send → shifted frame, ms (EWMA; Claude Code answers in ≈ 9 ms). */
   private latency = 12
@@ -316,8 +389,17 @@ export class SmoothScroll {
     term.attachCustomWheelEventHandler(this.onWheel)
     this.subs.push(
       term.onRender(this.onRender),
+      term.onWriteParsed(() => { this.parsedAt = performance.now() }),
       term.onResize(() => this.cancel('resize')),
-      term.buffer.onBufferChange(() => this.cancel('buffer'))
+      // A buffer switch is also how an app restarts (⌘R: Claude leaves the alternate screen and a new process
+      // enters it): its wheel state (Claude's flip debounce direction) starts over, and so does ours.
+      term.buffer.onBufferChange(() => { this.cancel('buffer'); this.forgetApp() }),
+      // ⌘R kills the old process without it leaving the alternate screen, so the new one's "enter alternate
+      // screen" changes no buffer: that request itself says a (new) app just took over the screen.
+      term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
+        if (params.some((p) => p === 1049 || p === 1047 || p === 47)) { this.cancel('buffer'); this.forgetApp() }
+        return false
+      })
     )
     this.reduced = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null
     // Capture phase on window: runs before xterm's own listeners (on its
@@ -345,8 +427,17 @@ export class SmoothScroll {
       mode: this.mode, glide: this.canGlide(), active: this.active, sent: this.sent, shown: this.shown,
       pending: this.pending, pos: this.P, frame: this.shown * this.rowH, v: this.shown * this.rowH - this.P,
       region: this.region, latency: Math.round(this.latency), rowH: this.rowH, overlay: this.overlay?.style.display ?? 'none',
-      resting: this.resting, drawn: this.drawnP
+      resting: this.resting, drawn: this.drawnP, edge: this.edge, lastReportDir: this.lastReportDir,
+      stallMs: Math.round(this.stallWindow()), travel: this.travel
     }
+  }
+
+  /** What we assumed about the app's own wheel state: gone with the app (restart, buffer or mode switch). */
+  private forgetApp(): void {
+    this.lastReportDir = 0
+    this.edge = 0
+    this.edgeKey = ''
+    this.forgiven = 0
   }
 
   /**
@@ -460,7 +551,7 @@ export class SmoothScroll {
     // Pinch-zoom (ctrl) and shift+wheel (horizontal) keep their defaults.
     if (ev.ctrlKey || ev.shiftKey || ev.deltaY === 0) return true
     const mode = this.currentMode()
-    if (mode !== this.mode) { this.cancel('mode'); this.mode = mode; this.acc = 0; this.lastReportDir = 0 }
+    if (mode !== this.mode) { this.cancel('mode'); this.mode = mode; this.acc = 0; this.forgetApp() }
     if (mode === 'native') return true
     const screen = this.screen()
     if (!screen || !this.term.rows) return true
@@ -483,7 +574,10 @@ export class SmoothScroll {
       this.origin = this.travel
       if (this.dir) this.holdDir = this.dir
       this.dir = 0
+      // A proven end holds for the next push only while the screen is what it was then.
+      if (this.edge && this.rowsKey() !== this.edgeKey) this.setEdge(0, 'screen changed')
     }
+    if (glide) this.reconcile(now)
 
     const notch = this.isNotch(ev, now)
     const sens = Math.max(0.1, this.opts.sensitivity() || 1)
@@ -549,6 +643,16 @@ export class SmoothScroll {
       if (this.travel < this.extreme) this.extreme = this.travel
       else if (this.travel - this.extreme >= TUNING.reversePx) { this.dir = 1; this.extreme = this.travel }
     }
+    // At a proven end (or start): the finger pushing on past it is overscroll — no rows, no debt. The content
+    // stops at the edge, and the first move back starts from there, exactly.
+    if (this.edge) {
+      if (this.dir === -this.edge) this.setEdge(0, 'reversed')
+      else if (this.dir === this.edge) {
+        const F = this.frameY() + this.pending * rowH
+        if ((this.travel - F) * this.edge > 0) this.travel = this.extreme = F
+        return 0
+      }
+    }
     // Where the finger will be when the frame lands: one display frame for
     // scrollback, the app's measured round trip (plus a frame) for a mouse app.
     const lookMs = this.mode === 'scrollback' ? 10 : 1.25 * this.latency + 4
@@ -600,6 +704,7 @@ export class SmoothScroll {
     if (out.length) this.opts.write(out.join(''))
     this.sent += n
     if (this.active) {
+      this.owed.push({ t: now, n })
       this.pending += n
       this.pendingAbs += Math.abs(n)
       this.lastSendAt = now
@@ -662,6 +767,7 @@ export class SmoothScroll {
     this.rowH = rowH
     this.shown = this.sent = this.mode === 'scrollback' ? this.term.buffer.active.viewportY : 0
     this.pending = this.pendingAbs = 0
+    this.owed = []
     this.travel = this.extreme = this.frameY()
     this.dir = this.holdDir = 0
     this.P = this.pO = this.drawnP = this.frameY()
@@ -688,6 +794,7 @@ export class SmoothScroll {
     if (this.mode === 'report') this.base += this.shown
     // Rows still in flight just land unglided; Layer 1 restarts from here.
     this.pending = this.pendingAbs = 0
+    this.owed = []
     this.lastRows = null
     this.region = null
     this.record({ t: performance.now(), kind: 'snap', reason, ms: 0 })
@@ -697,10 +804,11 @@ export class SmoothScroll {
     else if (!this.releaseTimer) this.releaseTimer = setTimeout(this.releaseCanvases, 3000)
   }
 
-  private readRows(): string[] {
+  private readRows(top?: number): string[] {
     const b = this.term.buffer.active
+    const y0 = top ?? b.viewportY
     const out: string[] = new Array(this.term.rows)
-    for (let r = 0; r < this.term.rows; r++) out[r] = b.getLine(b.viewportY + r)?.translateToString(true) ?? ''
+    for (let r = 0; r < this.term.rows; r++) out[r] = b.getLine(y0 + r)?.translateToString(true) ?? ''
     return out
   }
 
@@ -725,6 +833,7 @@ export class SmoothScroll {
     const cols = this.term.cols
     const rows = this.term.rows
     const patches: Patch[] = []
+    let fresh = false
     const pad = (t: string, n: number): string => (t.length < n ? t.padEnd(n) : t)
     const mask = (t: string, i0: number, i1: number): string => {
       const p = pad(t, i1)
@@ -764,7 +873,7 @@ export class SmoothScroll {
             const travels = pad(from, i1).slice(i0, i1) === text
             const stayed = pad(prev[row], i1).slice(i0, i1) === text
             const under = mask(next[row], i0, i1) === mask(from, i0, i1)
-            if (!travels && (under || stayed)) { patches.push({ row, c0: start, c1: x - 1 }); found = true }
+            if (!travels && (under || stayed)) { patches.push({ row, c0: start, c1: x - 1 }); found = true; if (!stayed) fresh = true }
           }
           start = -1
         }
@@ -776,6 +885,7 @@ export class SmoothScroll {
       }
     }
     region.patches = patches.length ? patches : undefined
+    region.fresh = fresh || undefined
     return region
   }
 
@@ -811,6 +921,13 @@ export class SmoothScroll {
     if (Math.abs(F - this.pO) > room) this.snapTo('too far')
   }
 
+  /** The content is exactly at the frame: the band source becomes the frame itself. */
+  private collapse(): void {
+    this.pO = this.frameY()
+    this.pctx?.drawImage(this.gl!, 0, 0)
+    this.blankChips(this.region?.patches)
+  }
+
   /** Show the real frame now (P = F) but stay active. */
   private snapTo(reason: string): void {
     this.P = this.pO = this.frameY()
@@ -821,8 +938,9 @@ export class SmoothScroll {
   }
 
   private onRender = (): void => {
+    this.renderedAt = performance.now()
     if (!this.active) return
-    const t0 = performance.now()
+    const t0 = this.renderedAt
     let shift: number | undefined
     let reason: string | undefined
     if (!this.canvasesMatch()) {
@@ -838,14 +956,53 @@ export class SmoothScroll {
     } else {
       const rows = this.readRows()
       const prev = this.lastRows ?? rows
-      const hit = this.pendingAbs > 0 ? findShift(prev, rows, this.pendingAbs + 1) : null
+      // Rows a stall dropped may still be answered by a slow app: look for that shift too, that way only.
+      // (Not once the finger has turned the other way: a shift that way is then nothing we asked for.)
+      const late = this.forgiven !== 0 && t0 - this.forgivenAt < TUNING.lateMs && this.dir !== -Math.sign(this.forgiven)
+      // Each way, at most what is owed that way (+1: a flip the app did not drop), plus a late answer's rows.
+      const limits: Record<number, number> = { [1]: 0, [-1]: 0 }
+      for (const e of this.owed) limits[Math.sign(e.n)] += Math.abs(e.n)
+      for (const d of [1, -1]) if (limits[d]) limits[d]++
+      if (late) limits[Math.sign(this.forgiven)] += Math.abs(this.forgiven) + 1
+      let hit = limits[1] || limits[-1] ? findShift(prev, rows, 0, limits) : null
+      // With nothing owed, only a late answer is a scroll.
+      if (hit && !this.pendingAbs && Math.sign(hit.s) !== Math.sign(this.forgiven)) hit = null
       if (hit) {
         shift = hit.s
-        this.pending -= hit.s
-        this.pendingAbs = Math.max(0, this.pendingAbs - Math.abs(hit.s))
-        if (!this.pendingAbs) this.pending = 0
         this.latency += 0.3 * (Math.max(4, Math.min(80, t0 - this.lastSendAt)) - this.latency)
-        this.accept(hit.s, this.withChips({ top: hit.top, bot: hit.bot }, prev, rows, hit.s))
+        const region = this.withChips({ top: hit.top, bot: hit.bot }, prev, rows, hit.s)
+        // Claude leaving its end re-lays out in that same frame: its sticky prompt header takes row 0 and
+        // "Jump to bottom" appears on the last transcript row. Row 0 is then chrome, not a row scrolling in
+        // (what scrolled in is under the header); drawn as content it slid down the screen with the text.
+        // Either sign says so: a chip that was not there last frame, or the screen leaving its end state.
+        const leaving = region.fresh || (this.atEnd(prev) === 1 && this.atEnd(rows) !== 1)
+        if (hit.s < 0 && region.top === 0 && leaving && rows[0] !== prev[0] && region.bot > 0) { region.top = 1; reason = 'left end' }
+        // Scrolling up across a turn, the sticky header swaps one prompt for another: row 0 was fixed last frame
+        // and is the same kind of row now, so it is still chrome, not a row scrolling in.
+        const header = (t: string | undefined): boolean => !!t && t.startsWith('❯ ')
+        if (hit.s < 0 && region.top === 0 && this.region && this.region.top > 0 && header(prev[0]) && header(rows[0]) && region.bot > 0) region.top = 1
+        // Claude entering its end re-lays out too: the sticky header goes and row 0 becomes transcript, and
+        // it is usually a jump (scrollToBottom takes all that is left). The band would come from the previous
+        // composite, which holds the header there — chrome, not the content that belongs in the band — and
+        // nothing else has that content: snap that one frame (the real frame, crisp) instead of a torn glide.
+        const entering = hit.s > 0 && this.atEnd(prev) !== 1 && this.atEnd(rows) === 1
+        this.accept(hit.s, region)
+        if (entering && this.P !== this.frameY()) { reason = 'entered end'; this.snapTo(reason) }
+        // The oldest rows owed that way are answered; what is left over nothing was owed for.
+        const extra = this.answer(hit.s, t0)
+        if (extra && late && Math.sign(extra) === Math.sign(this.forgiven)) {
+          // A late answer: the app was slow. Follow it, and the finger with it. It also lifts the edge,
+          // unless the screen says the app is at that end (then it is output growing there, not an answer).
+          const d = Math.sign(extra)
+          this.forgiven = Math.abs(this.forgiven) > Math.abs(extra) ? this.forgiven - extra : 0
+          if (this.atEnd(rows) !== d) this.setEdge(0, 'late answer')
+          this.answerMs = Math.max(this.answerMs, Math.min(TUNING.stallMaxMs, 1.25 * this.stallWindow()))
+          const F = this.frameY()
+          this.travel += extra * this.rowH
+          if ((this.travel - F) * d > 0) this.travel = F
+          if (this.dir === d) this.extreme = this.travel
+          reason = 'late'
+        }
       } else if (this.region && this.P !== this.frameY()) {
         // Not a scroll. Small edits inside the region (a spinner, the sticky
         // header appearing) glide along; an edge row that changed is fixed
@@ -856,12 +1013,27 @@ export class SmoothScroll {
           // (A row merely redrawn in place, like the spinner line, stays.)
           while (this.region.top < this.region.bot && !editedInPlace(prev[this.region.top], rows[this.region.top])) { this.region.top++; changed-- }
           while (this.region.bot > this.region.top && !editedInPlace(prev[this.region.bot], rows[this.region.bot])) { this.region.bot--; changed-- }
-          if (changed > (this.region.bot - this.region.top + 1) * 0.3) { reason = 'content changed'; this.snapTo(reason) }
+          if (changed > (this.region.bot - this.region.top + 1) * 0.3) {
+            reason = 'content changed'
+            this.snapTo(reason)
+            // A jump too big to match (a starved renderer, or the app jumping on its own) may have taken
+            // rows we asked for: what it took is unknown, so nothing is owed any more and the finger maps
+            // from the frame now shown. Rows still draining in the app come in as late answers.
+            if (this.pendingAbs) {
+              this.forgiven = this.pending
+              this.forgivenAt = t0
+              this.owed = []
+              this.syncOwed()
+              this.travel = this.extreme = this.frameY()
+            }
+          }
           // A chip can appear (or go) without a scroll, a frame after one.
           else this.region = this.withChips({ top: this.region.top, bot: this.region.bot }, prev, rows, 0, this.region.patches)
         }
       }
       this.lastRows = rows
+      // While the finger still pushes at a proven end, what the app draws there is what the next push must find.
+      if (this.edge && this.live) this.edgeKey = rows.join('\n')
     }
     // Same task as the WebGL draw, so the overlay never shows a frame late.
     if (this.shownOverlay || this.P !== this.frameY()) { this.draw(); this.show() }
@@ -890,22 +1062,20 @@ export class SmoothScroll {
     if (!this.canvasesMatch()) { this.deactivate('canvas'); return }
     const t0 = performance.now()
     const dt = Math.max(0, Math.min(0.05, (now - this.lastTick) / 1000))
+    if (now > this.lastTick) this.frameMs += 0.2 * (Math.max(4, Math.min(100, now - this.lastTick)) - this.frameMs)
     this.lastTick = now
-    const F0 = this.frameY()
-    // Rows the app never answered (its top or bottom): forget them.
-    if (this.pendingAbs && t0 - this.lastSendAt > Math.max(TUNING.pendingMs, 4 * this.latency)) {
-      this.pending = this.pendingAbs = 0
-      this.sent = this.shown
-      // A finger pushing past the end must not be followed later; once the
-      // gesture is over the content stays put whatever went unanswered.
-      if (this.live) this.travel = this.extreme = F0
-    }
+    // Rows the app has stopped answering (its end or its start) are not owed: dropped every frame, not on a timer.
+    this.reconcile(t0)
     // The gesture (or its momentum) is over. Nothing moves because of it:
     // the content stays where the finger left it, off the row grid if need be.
     if (this.live && t0 - this.lastWheel > Math.max(TUNING.idleMinMs, Math.min(TUNING.idleMaxMs, 2 * this.gap))) this.live = false
     this.step(dt)
     if (this.shownOverlay) this.draw()
     const F = this.frameY()
+    // Caught up with the frame: nothing older than it may be shown again. Without this a reversal could
+    // glide back over the previous composite, which at a boundary still holds the screen from before the
+    // app re-laid out there (Claude's sticky header and "Jump to bottom" chip as they were).
+    if (this.P === F && this.pO !== F) this.collapse()
     this.emitProbe('tick')
     this.record({ t: now, kind: 'tick', ms: performance.now() - t0 })
     if (!this.live && !this.pendingAbs && this.pv === 0) {
@@ -942,6 +1112,107 @@ export class SmoothScroll {
     this.record({ t, kind: 'retarget', rows: n, reports, ms: 0 })
     return true
   }
+
+  /**
+   * Keep the model equal to what the app shows, every frame and every wheel event (mouse apps). A send is
+   * owed until a shift answers it. It is not owed any more when nothing has answered rows that way for the
+   * stall window since it was sent — the app is at its end or start (Claude clamps a report past its bottom
+   * with scrollToBottom and draws nothing) or answered fewer than asked — or when the screen says the app is
+   * at that end (output growing at Claude's sticky bottom shifts the transcript like an answer, so time alone
+   * cannot tell there). Kept, such rows were phantom debt: the finger's travel ran on past the frame, the
+   * next gesture's content stayed clamped to a frame rows away from it (frozen, then "too far" snaps), and
+   * region detection searched shifts of 90+ rows. So: drop them, cut the travel that ran past the frame that
+   * way, and if the finger is still pushing, pin the edge — all debt that way goes, and `lead` sends nothing
+   * more that way until the finger reverses.
+   */
+  private reconcile(now: number): void {
+    if (this.mode !== 'report' || !this.owed.length) return
+    // Output still on its way (held, unparsed, or parsed but not drawn yet) may hold the answer. (Parsed output
+    // that changed nothing visible never renders: after 50 ms it is not on its way any more.)
+    if (this.opts.outputPending?.() || (this.parsedAt > this.renderedAt && now - this.parsedAt < 50)) return
+    const wait = this.stallWindow()
+    const end = this.lastRows ? this.atEnd(this.lastRows) : 0
+    const endWait = Math.max(TUNING.endMs, 2 * this.frameMs)
+    const gone: Record<number, number> = { [-1]: 0, [1]: 0 }
+    this.owed = this.owed.filter((e) => {
+      const d = Math.sign(e.n)
+      const age = now - e.t
+      const drop = now - Math.max(e.t, this.answered[d]) >= wait || age >= TUNING.owedMaxMs || (end === d && age >= endWait)
+      if (drop) gone[d] += e.n
+      return !drop
+    })
+    if (!gone[1] && !gone[-1]) return
+    const F = this.frameY()
+    for (const d of [1, -1]) {
+      if (!gone[d]) continue
+      // The finger still pushes that way: the edge is proven, nothing more is owed that way.
+      const pin = this.live && this.dir === d
+      if (pin) for (const e of this.owed) if (Math.sign(e.n) === d) { gone[d] += e.n; e.n = 0 }
+      this.owed = this.owed.filter((e) => e.n !== 0)
+      // The finger's travel past what is still owed that way is overscroll. (The content never went past
+      // the frame — P stays within [P_O, F] — so this moves nothing on screen.)
+      let still = 0
+      for (const e of this.owed) if (Math.sign(e.n) === d) still += e.n
+      const Fd = F + still * this.rowH
+      if ((this.travel - Fd) * d > 0) this.travel = Fd
+      if ((this.extreme - Fd) * d > 0) this.extreme = Fd
+      this.forgiven = gone[d]
+      this.forgivenAt = now
+      if (pin) this.setEdge(d, end === d ? 'end on screen' : 'stall')
+      else this.record({ t: now, kind: 'boundary', reason: 'dropped', rows: gone[d], ms: 0 })
+    }
+    this.syncOwed()
+  }
+
+  /** pending / pendingAbs / sent from what is owed (sent = the row the app will be at once it has answered). */
+  private syncOwed(): void {
+    let p = 0
+    let a = 0
+    for (const e of this.owed) { p += e.n; a += Math.abs(e.n) }
+    this.pending = p
+    this.pendingAbs = a
+    this.sent = this.shown + p
+  }
+
+  /** A shift answers the oldest rows owed its way. Returns the rows of it nothing was owed for (signed). */
+  private answer(s: number, now: number): number {
+    const d = Math.sign(s)
+    let left = Math.abs(s)
+    for (const e of this.owed) {
+      if (!left) break
+      if (Math.sign(e.n) !== d) continue
+      if (left === Math.abs(s)) {
+        // How long this app takes to answer right now (it is slower while it works): the stall window follows.
+        this.answerMs = Math.max(Math.min(TUNING.stallMaxMs, now - Math.max(e.t, this.answered[d])), this.answerMs * 0.97)
+      }
+      const take = Math.min(left, Math.abs(e.n))
+      e.n -= d * take
+      left -= take
+    }
+    this.answered[d] = now
+    this.owed = this.owed.filter((e) => e.n !== 0)
+    this.syncOwed()
+    return d * left
+  }
+
+  /** The app's own word on where it is: +1 at its end, −1 at its start, 0 (see `SmoothScrollOptions.atEnd`). */
+  private atEnd(rows: string[]): number {
+    return this.opts.atEnd?.(rows) ?? 0
+  }
+
+  /** No shift for this long means no answer is coming: 1.5× the slowest recent answer + a frame, within bounds. */
+  private stallWindow(): number {
+    return Math.max(TUNING.stallMs, 6 * this.frameMs, Math.min(TUNING.stallMaxMs, 1.5 * this.answerMs + 16))
+  }
+
+  private setEdge(d: number, reason: string): void {
+    if (d === this.edge) return
+    this.edge = d
+    this.edgeKey = d ? this.rowsKey() : ''
+    this.record({ t: performance.now(), kind: 'boundary', reason: `${d > 0 ? 'end' : d < 0 ? 'start' : 'free'}: ${reason}`, rows: d ? this.forgiven : 0, ms: 0 })
+  }
+
+  private rowsKey(): string { return this.readRows().join('\n') }
 
   private restKey = ''
 
@@ -1077,7 +1348,8 @@ export class SmoothScroll {
       kind, t: performance.now(), gl: this.gl, overlay: this.overlay, visible: this.overlay?.style.display === 'block',
       frameY: this.frameY() + bp, drawnY: (this.shownOverlay || kind === 'hide' ? this.drawnP : this.frameY()) + bp, rowH: this.rowH,
       region: this.region ? { top: this.region.top, bot: this.region.bot, patches: this.region.patches?.map((p) => ({ ...p })) } : null,
-      rows: this.lastRows ?? this.readRows()
+      // Scrollback: the rows of the frame N actually shows (scrollLines moves viewportY before xterm renders).
+      rows: this.lastRows ?? this.readRows(this.mode === 'scrollback' && this.active ? this.shown : undefined)
     })
   }
 

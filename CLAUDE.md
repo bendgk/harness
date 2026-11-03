@@ -1101,8 +1101,30 @@ xterm.js answering no XTVERSION, Claude uses its "native window" path, base 1 li
 `wheelScrollAccelerationEnabled` off in the `--settings` it passes to every Claude launch, local and remote, so k reports
 = k lines exactly (without that, 1:1 reports plus Claude's ramp overshoot). Claude also **drops the first report after
 a direction change** (flip debounce), so Paper sends one extra on each reversal (`dropsFlipReport`, Claude panes only).
+Its direction is that of the last report it *received*, phantom ones past its end included, so the extra is right off
+a boundary too. A new Claude starts with no direction and drops nothing, so Paper's side is reset (`forgetApp`) on a
+buffer switch, a mode change, and any "enter alternate screen" request (DECSET 1049/1047/47, seen through
+`term.parser`): ⌘R kills the old process without it leaving the alternate screen, so the new one's request changes no
+buffer. (Measured after ⌘R with Paper's last direction down: the first up drag sent 22 reports, no extra, and moved
+20 rows — the same 20 as the drag after a rest, with its extra.)
 Sessions started before this change keep acceleration until ⌘R. If xterm.js ever answers XTVERSION with "xterm.js…",
 Claude switches to its `wheelFlood` path (3 lines for reports > 40 ms apart) and this needs revisiting.
+
+What Claude does with the rows (same binary, ScrollBox `scrollBy`/`scrollToBottom` and render-node-to-output):
+- A report only adds to `pendingScrollDelta`; each render **drains** it: all of it up to 4 rows, else ¾ per frame
+  (at most viewport − 1), so a big request lands over several frames. Outside its virtualisation clamp it drains only
+  min(4, viewport / 8) rows per frame. (`useAdaptiveDrain`, 2/3-rows-per-frame steps, is on only for an xterm.js
+  XTVERSION reply.)
+- **At its bottom** a down report that would pass the end calls `scrollToBottom()`: the rest of the pending delta is
+  dropped, the view jumps to the end at once and turns **sticky**, and further down reports change nothing — no
+  frame is drawn for them. At the top, `scrollTo(0)` likewise. Sticky, the transcript follows output: while Claude
+  streams, the screen shifts up exactly as if it scrolled down.
+- **Leaving the bottom re-lays out in that same frame**: the sticky prompt header (`❯ <last prompt>`, truncated)
+  takes row 0, the transcript moves down one row (what scrolled in is under the header), and the chip appears on
+  the last transcript row: "Jump to bottom", or "N new message(s)" once output arrived while scrolled up, then
+  " (click) ↓" (or ": <key> to scroll", " (<key>) ↓", " ↓"). Entering the bottom removes both.
+- Not sticky, a shrinking transcript keeps `scrollHeightHwm` (high-water mark): scrollTop can sit above the
+  drawable maximum, so the first up rows after a turn ends can be eaten (no visible shift).
 
 **Layer 2: the glide** (WebGL only; `new WebglAddon(true)` = preserveDrawingBuffer so the last frame can be copied
 at any time). While a scroll is in progress, **and while it rests off the row grid afterwards**, an opaque
@@ -1118,9 +1140,11 @@ is never a frame late) and on rAF while P moves. Offsets are whole device pixels
   xterm.js never sends, so the Claude provider sets `CLAUDE_CODE_FORCE_SYNC_OUTPUT=1` (local launches; ignored
   inside tmux, so remote panes are unchanged) and every frame arrives as `CSI ? 2026 h … CSI ? 2026 l`. xterm 5.5
   ignores the pair; `lib/sync-output.ts` (`SyncOutput`, in front of `term.write` in TerminalPane) holds everything
-  between them and writes it to xterm as one chunk, which xterm parses in one go. Markers split across chunks are
-  carried; a frame without its ESU is released after 150 ms. Any other program that uses 2026 (Codex, nvim)
-  benefits too. Sessions started before this change get it on ⌘R.
+  between them and writes it to xterm as one chunk, which xterm parses in one go (its WriteBuffer never splits a
+  chunk across renders, even past 128 KB). Markers split across chunks are carried; a frame without its ESU is
+  released after 150 ms — but a hold timer that fires more than 1.5× late (the renderer was blocked, so the ESU may
+  be queued behind it) first gives queued output one 16 ms turn, or a busy window releases half a frame. Any other
+  program that uses 2026 (Codex, nvim) benefits too. Sessions started before this change get it on ⌘R.
 - **Region and shift.** Scrollback panes: `viewportY` (the whole screen). Mouse apps: `findShift` compares row text of
   the previous and new frame for shifts up to the rows still pending (+1), counting only rows that *changed* and now
   equal the shifted old row, so Claude's input box, rules, status line and its sticky prompt header (row 0 when
@@ -1128,7 +1152,20 @@ is never a frame late) and on rAF while P moves. Offsets are whole device pixels
   (`editedInPlace`: same letters, or one a prefix of the other — the spinner line "✢ Vibing… (8s · ↓ 214 tokens)",
   streamed text), so the spinner under the transcript scrolls with it. Small in-region edits keep gliding; an edge
   row that changed into something else (the sticky header appearing) leaves the region; bigger changes (streaming)
-  snap. Claude answers a report in ≈ 9 ms and draws ≈ 60 fps, several rows per frame.
+  snap. Claude answers a report in ≈ 9 ms and draws ≈ 60 fps, several rows per frame (measured idle: first
+  answer p50 8.5 ms, max 29; gaps while rows are owed p50 16.6, max 20.5; streaming: first answer max 76 ms).
+  `findShift` searches only the ways rows are owed and only as far (`limits`: owed that way + 1, plus a late
+  answer's rows), and weighs each matching row by 1/k when the frame has its text k times: a transcript that
+  repeats itself (the same prompt-and-reply block many times) otherwise matched a shift the other way, too far,
+  or by a multiple of the block, as well as the true one (the alias held the unique rows fixed — a torn frame).
+  Rows scrolling in at the leading edge that did not change at all are chrome, not content (the sticky header
+  when the prompt row scrolling in under it is the same text), and so is a row-0 header (`❯ …`) that was fixed last
+  frame and swaps one prompt for another while scrolling up across a turn. **Leaving the end** (a shift up whose frame also has a *fresh* chip — one that was not there last frame —
+  or whose screen just left `atEnd`, and a changed row 0): row 0 is Claude's sticky header, not a row scrolling
+  in, so the region starts at row 1 (`'left end'` in the trace); counted as incoming, it slid down the screen with
+  the text. **Entering the end** (a shift down into `atEnd`): the header goes and row 0 becomes transcript, usually
+  in a jump; the band would come from the previous composite, which has the header there and nothing else has
+  that content, so that one frame snaps to the real frame (`'entered end'`).
 - **Chips** (`withChips`, every shift and every in-region change): a run of 4…0.6·cols cells with an explicit
   background, ≥ 3 characters, that did *not* travel with its row (its text is not the shifted source's text there),
   while the rest of the row is that source, shifted (a chip that just appeared over moving content), or the run was
@@ -1143,9 +1180,31 @@ is never a frame late) and on rAF while P moves. Offsets are whole device pixels
 - **Motion.** Critically damped spring, guarded so P never passes its target (no overshoot, no oscillation):
   `omegaTrack` 160 while following the finger, never faster than 1.3× the finger's speed (`catchUp`, so catching up
   with a late frame is not a jump); `omegaGlide` 70 for notches (a notch glides onto its rows and the overlay goes).
-  A resumed gesture keeps its mapping and P never runs back toward a finger still moving forward. Rows the app never
-  answers (the top or bottom of its transcript) are forgotten after 260 ms (the finger is re-anchored only while
-  the gesture is live).
+  A resumed gesture keeps its mapping and P never runs back toward a finger still moving forward. Once P has caught
+  up with the frame (P = F), the band source collapses onto it (`collapse`: P_O = F, O = N), so nothing older than
+  the frame can be shown again — a reversal can no longer glide back over a composite from before the app re-laid
+  out (at its end: header and chip as they were).
+- **Boundaries — a model that corrects itself every frame** (mouse apps; `reconcile`, run on every tick and wheel
+  event). Every send is owed (`owed`: signed rows + send time, oldest first) until a shift answers it; each shift
+  answers the oldest rows owed its way (`answer`), and `pending`/`sent` are always derived from what is still owed
+  (`syncOwed`: sent = shown + pending), so they cannot drift from what the app shows. A send is **not owed any
+  more** when nothing answered rows that way for the stall window since it was sent (≥ 80 ms; 1.5× the slowest
+  recent answer + 16, which grows while Claude works; ≥ 6 of our own frames, so a starved renderer does not
+  misjudge; ≤ 250), or when the screen says the app is at that end (`atEnd`, below: then after 2 frames, ≥ 34 ms,
+  because output growing at Claude's sticky bottom shifts the screen like an answer), or after 1.5 s regardless.
+  Never while output is in flight (`outputPending`: a held DEC 2026 frame or writes xterm has not parsed; or parsed
+  but not yet rendered). Dropping cuts the finger's travel back to the frame that way (overscroll, not debt; P ≤ F
+  anyway, so nothing moves on screen). If the finger is still pushing that way, the edge is **pinned** (`edge`,
+  trace `boundary` "end:/start: stall | end on screen"): all debt that way goes, `lead` clamps the travel to the
+  frame and sends nothing more that way until the finger reverses ("free: reversed") — the first move back starts
+  from the frame exactly, with the usual flip extra. The pin outlives the gesture while the screen is unchanged
+  (`edgeKey`), so pushing again at the bottom sends nothing; any change (output, typing) re-probes ("free: screen
+  changed"). Rows dropped by a stall that a slow app answers after all (within 500 ms, that way) are a **late
+  answer**: followed (the finger too) and the pin lifted, unless the screen shows that end (then it is output
+  growing there). A "content changed" snap while rows are owed forgives them the same way (a jump too big to
+  match). `atEnd` for Claude (`claudeAtEnd` in TerminalPane): no "Jump to bottom" chip and no `❯ ` header at row
+  0 = its sticky bottom. Scrollback panes need none of this: `scrollLines` is synchronous and travel is clamped to
+  [0, baseY].
 - **Rest — no snap at the end.** There is no settle onto the grid: Chromium wheel events carry no lift phase, so the
   end of a gesture (2 event intervals without events, 24–90 ms) cannot be told from a finger pausing mid-row, and
   any correction after it would be movement starting after a pause. The target stays the finger, so the content
@@ -1167,7 +1226,9 @@ is never a frame late) and on rAF while P moves. Offsets are whole device pixels
   the text anyway).
 - **Cancels.** Typed input (anything `onData` sends that is not a mouse or focus report), paste, resize (font change
   included), buffer switch, mode change and a theme switch hide the overlay at once (the real frame shows, i.e. a
-  snap — these are explicit actions). Clicks, modifier keys, app shortcuts and tab switches do not.
+  snap — these are explicit actions). Clicks, modifier keys, app shortcuts and tab switches do not. None of these
+  leaves state behind that a rest would have cleared: owed rows age out on every frame, the pin is checked against
+  the screen at every gesture start, and the band source collapses whenever the content reaches the frame.
   `prefers-reduced-motion`, `TUNING.glide = false` or no WebGL canvas: Layer 1 only (classic remainder carry).
 
 **Knobs.** Prefs (`WidgetPrefs`, persisted in `state.json` → `widgets`, visible in `ui_state.widgets` and `state_get`):
@@ -1177,7 +1238,8 @@ is never a frame late) and on rAF while P moves. Offsets are whole device pixels
 **Measuring it (dev only).** `window.__paperScroll`: `panes` (sessionId → `{ term, scroller }`; `scroller.stats()`),
 `tuning` (live `TUNING`), `trace` (`on`, `records`). With `trace.on = true` every wheel event, render and frame is
 recorded: rows/reports sent, detected shift and region, `v` = F−P, `pos` = P (the effective content position, rows
-shifted × rowH − v; continuous across activations), handler cost `ms`. Replay gestures by dispatching
+shifted × rowH − v; continuous across activations), handler cost `ms`, and `boundary` records (pins, unpins,
+dropped rows). `stats()` also has `edge`, `lastReportDir` and the current `stallMs`. Replay gestures by dispatching
 `new WheelEvent('wheel', { deltaY, clientX, clientY, bubbles: true, cancelable: true })` on `.xterm-screen` once per
 animation frame, with `Object.defineProperty(ev, 'wheelDeltaY', { value })` (−3·deltaY for a mac trackpad, ∓120 for a
 notch). Inactive tabs are `visibility: hidden`, so pick the pane whose `.xterm` is visible. Never `getImageData` the
@@ -1194,9 +1256,23 @@ copy samples texel edges, which the two canvas types round differently — false
 line in segments. A frame is right when: rows outside the region equal N; region rows equal N shifted by F−P
 (chip cells skipped where drawn and where their row came from); every row whose content is identifiable (the
 `seq` numbers, a numbered list) equals that content's pixels as last seen live, band included; no identifiable
-transcript row is held fixed while the region is offset; and the last composite before the overlay hides equals N.
-Run it while Claude works (a `sleep 1` loop) and while it streams a reply, near the bottom (spinner, counters, chip)
-and mid-transcript, for slow drags, flicks, reversals and notches, and for a few seconds at rest.
+transcript row is held fixed while the region is offset; the last composite before the overlay hides equals N; no
+line inside the numbered span of the region belongs to another content position or to nothing seen (a *torn
+line*: match each line's left segment against every rendering of every numbered row seen live, at one common
+offset); and Claude's sticky header (N's row 0, `❯ …`) is never drawn moved. Keep every rendering of a row, not
+only the latest: xterm's WebGL output for the same digits differs slightly between frames, and a band showing an
+older rendering is not a tear. Run it while Claude works (a `sleep 1` loop) and while it streams a reply, near the
+bottom (spinner, counters, chip) and mid-transcript, for slow drags, flicks, reversals and notches, and for a few
+seconds at rest. Per-frame checks cannot see a frozen P (a composite at the wrong position is still
+self-consistent): also compare, per gesture, the content's lag behind the finger, the largest per-frame jump, the
+largest |F − P|, "too far" snaps, rows moved vs finger travel and reports written at an edge — and always compare the
+**first gesture after an event** (a boundary, a reversal, typing, a tab switch or resize, a turn ending, a restart,
+during streaming) with the same gesture **after a 2 s rest**: they must match. Frame capture slows the renderer
+(hashing two full 2× canvases per probe is ≈ 30 ms; hash only the left quarter, where the numbers are, to keep
+frames near real speed), which itself exercises the starved-renderer paths; take motion numbers from uncaptured
+runs. `ProbeFrame.rows` is the text of the frame N shows (in scrollback, the rows at the rendered viewport, not
+`viewportY`, which `scrollLines` moves before xterm renders). Test transcripts that repeat themselves (many identical
+turns) are worth keeping: they exposed the shift aliasing above.
 
 ## Verifying a change — recipes
 
@@ -1286,6 +1362,34 @@ Codex accounts use the windows their own transcripts report (from the usage snap
   - *A stretched or blank frame on a font change mid-glide.* The rAF tick composited a resized (cleared) WebGL canvas
     into the old-sized overlay before xterm's render noticed. Fix: the tick checks the canvas sizes too. A theme
     switch now cancels the glide (the band was in the old colours).
+  - *The first scroll up after scrolling past Claude's bottom was torn; after a rest it was fine.* Four causes,
+    all proven from traces (see *Boundaries*):
+    1. **Phantom debt.** Past its bottom Claude answers down reports with `scrollToBottom` and draws nothing, but
+       Paper kept counting them as owed: the forget timer (260 ms after the *last* send) never ran out while
+       momentum kept sending, and even when it did, the finger was re-anchored only mid-gesture. Measured: the up
+       drag started with 94 rows owed and the finger's travel 93 rows past the frame; P stayed clamped at the old
+       frame (`pos 0` while Claude scrolled 28 rows, |F−P| up to 546 px, the region mostly band from a stale
+       composite), then "too far" snaps of 585–721 px; the up flick moved 68–71 rows for 79 and sent 9–17 *down*
+       reports. A rest let the timer drop the debt and the next gesture start from the frame. Fix: the owed-rows
+       model, the stall window, the pin.
+    2. **Claude's re-layout at its end** (leaving: header at row 0, chip, transcript one row down — in one
+       frame): `findShift` counted row 0 as a row scrolling in, so the header was drawn sliding down into the
+       text ("header moved" with dN = −156 device px in the capture). Entering: the band above row 0 came from a
+       composite that had the header there (19 "band != content" frames in a stress run). Fix: the *left end*
+       rule, the *entered end* snap, and chrome rows never counted as scrolling in.
+    3. **Growth at the sticky bottom looked like answers.** While Claude streams, sticky, the transcript shifts up
+       every few frames; those shifts "answered" the phantom down rows, so a no-shift stall never fired and the
+       same freeze came back. Fix: the screen's own word (`atEnd`, Claude's chip and header) and per-send ageing.
+    4. **A stale composite survived the boundary**: after P caught up with the frame at the end, a reversal could
+       still glide back over the previous composite (from before Claude's re-layout). Fix: `collapse`.
+    Also found on the way: a starved renderer (frame capture, a blocked window) misjudged a stall (now ≥ 6 of our
+    frames, never with output in flight) and `SyncOutput`'s hold timer could fire before the queued ESU and release
+    half a frame (now a 16 ms grace when it fires late); a repetitive transcript let `findShift` match a shift the
+    other way, too far or by a block multiple (now limited to what is owed each way and weighted by uniqueness);
+    ⌘R left Paper's flip assumption stale (now reset on "enter alternate screen"); and `claudeAtEnd` must know
+    both chip labels — "Jump to bottom" and "N new message(s)" — or the transcript's top (no header there) reads
+    as its end. Ruled out: the flip extra is right off a boundary (Claude
+    tracks the direction of every report it receives), and resting offsets never sat past the end (P ≤ F).
   - Checked and not bugs: the WebGL canvas is fully opaque (alpha 255 everywhere, so the opaque 2D overlay shows
     the same colours), region and band offsets are whole device pixels at 2× DPR, the fill colour for blanked chips
     matches xterm's background pixels exactly, and preserveDrawingBuffer showed no visual side effect.

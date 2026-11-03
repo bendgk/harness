@@ -99,6 +99,17 @@ const REPORT = new RegExp('^(?:' + [
   '\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)', '\\x1bP[\\s\\S]*?\\x1b\\\\'
 ].join('|') + ')+$')
 
+/**
+ * Claude Code's fullscreen screen at its sticky bottom (+1), else unknown (0). See `SmoothScrollOptions.atEnd`.
+ * Scrolled up, Claude shows a chip on the last transcript row — "Jump to bottom", or "N new message(s)" once output
+ * arrived meanwhile, followed by " (click) ↓", ": <key> to scroll", " (<key>) ↓" or " ↓" (2.1.317) — and, below
+ * the first prompt, the sticky prompt header at row 0.
+ */
+const CLAUDE_CHIP = /(?:Jump to bottom|\d+ new messages?)(?: \(|: | ↓)/
+function claudeAtEnd(rows: string[]): number {
+  return rows.some((r) => CLAUDE_CHIP.test(r)) || /^❯ /.test(rows[0] ?? '') ? 0 : 1
+}
+
 /** Where the dropdown sits, in pane-body pixels. */
 interface Anchor { left: number; top?: number; bottom?: number; placement: 'above' | 'below' }
 
@@ -192,6 +203,11 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       void api.session.write(sessionId, d)
     }
 
+    // Frames a program wraps in DEC 2026 reach xterm whole (lib/sync-output.ts). `unparsed` counts writes
+    // xterm has not parsed yet: the scroller never decides the app went silent while output is in flight.
+    let unparsed = 0
+    const sync = new SyncOutput((d) => { unparsed++; term.write(d, () => { unparsed-- }) })
+
     // ---- smooth scrolling (lib/smooth-scroll.ts) ------------------------------
     const scroller = new SmoothScroll(term, {
       write: (d) => send(d),
@@ -199,6 +215,10 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       notchRows: () => useStore.getState().widgets.scrollNotchRows ?? 3,
       // Claude Code drops the first wheel report after a direction change.
       dropsFlipReport: () => provider === 'claude',
+      outputPending: () => unparsed > 0 || sync.holding,
+      // Claude Code at its sticky bottom shows neither "Jump to bottom" nor the sticky prompt header (row 0,
+      // "❯ …"); scrolled anywhere above it shows both. Output growing there must not read as an answer.
+      atEnd: provider === 'claude' ? claudeAtEnd : undefined,
       // Content resting off the row grid moves the alternate-screen mention tags with it.
       onLayout: () => highlightRef.current?.relayout(),
       trace: import.meta.env.DEV ? (r) => devScroll()?.push(sessionId, r) : undefined,
@@ -353,8 +373,6 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       sendResize()
     })
 
-    // Frames a program wraps in DEC 2026 reach xterm whole (lib/sync-output.ts).
-    const sync = new SyncOutput((d) => term.write(d))
     const off = api.onPtyData((p) => {
       if (p.sessionId === sessionId) sync.feed(p.data)
     })

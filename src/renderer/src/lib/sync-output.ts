@@ -20,6 +20,8 @@ export class SyncOutput {
   private held: string[] | null = null
   private carry = ''
   private timer: ReturnType<typeof setTimeout> | 0 = 0
+  private armedAt = 0
+  private graced = false
 
   constructor(private readonly write: (data: string) => void, private readonly maxHoldMs = 150) {}
 
@@ -58,11 +60,22 @@ export class SyncOutput {
   }
 
   private arm(): void {
-    if (!this.timer) this.timer = setTimeout(this.expire, this.maxHoldMs)
+    if (this.timer) return
+    this.armedAt = performance.now()
+    this.graced = false
+    this.timer = setTimeout(this.expire, this.maxHoldMs)
   }
 
   private expire = (): void => {
     this.timer = 0
+    // A timer that fires well past its time means the renderer was blocked, and the rest of the frame
+    // (its ESU) may be waiting in the IPC queue behind it: give queued output one short turn first, or
+    // a busy window would release half a frame — exactly the tear this exists to prevent.
+    if (!this.graced && performance.now() - this.armedAt > this.maxHoldMs * 1.5) {
+      this.graced = true
+      this.timer = setTimeout(this.expire, 16)
+      return
+    }
     const rest = this.carry
     this.carry = ''
     this.release()
@@ -71,6 +84,7 @@ export class SyncOutput {
 
   private release(): void {
     if (this.timer) { clearTimeout(this.timer); this.timer = 0 }
+    this.graced = false
     const h = this.held
     this.held = null
     if (h && h.length) this.write(h.join(''))
