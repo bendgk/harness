@@ -192,8 +192,14 @@ long jobs under `tmux new -d` / `nohup`), never to fix ssh or install anything, 
   remote session, bound to `{sessionId, host}`. Only sha256 hashes are stored (`~/.paper/gateway-tokens.json`, 0600,
   atomic); comparison is constant-time over all records. The token exists only in the remote agent's MCP config,
   uploaded 0600 (dir 0700) to `~/.paper/run/<sessionId>.json` by `provisionRemoteSession` — which returns the absolute
-  path for `claude --mcp-config`. Re-provisioning rotates the token; `revokeRemoteSession` drops it and deletes the
-  remote file. Tokens survive restarts so agents that kept running in tmux reconnect once the tunnel is back.
+  path for `claude --mcp-config`. **Provisioning is idempotent**: a running agent read its config once, at launch,
+  and holds the token in memory, so if a hash for (sessionId, alias) is on file and the remote config still exists
+  (`[ -f ]`), nothing is rewritten and the same token keeps working — call it freely on restore. Otherwise (no hash,
+  file gone, session now on another alias, or tokens revoked by a port rotation) a fresh token is uploaded and the
+  result has `rotated: true`: a process already running cannot see it, so tell the user Paper tools are unavailable
+  until the agent restarts (⌘R). If ssh fails during the check, it throws instead of rotating.
+  `revokeRemoteSession` drops the token and deletes the remote file. Tokens survive restarts, so agents that kept
+  running in tmux reconnect once the tunnel is back.
 - Remote callers get a scoped MCP server (`handleMcpRequest` in `mcp.ts` with a filtered tool list + wrapped invoke):
   only `REMOTE_SCOPE` tools are listed or callable — not `tools_invoke`/`tools_list`, so the filter cannot be
   bypassed. `self` tools get `id` forced to the caller's session (a different id is refused, never retargeted);

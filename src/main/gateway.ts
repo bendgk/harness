@@ -521,18 +521,44 @@ const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
 const runFile = (sessionId: string): string => `~/.paper/run/${sessionId}.json`
 
+async function absoluteRunFile(alias: string, sessionId: string): Promise<string> {
+  let home = getMachine(alias)?.probe?.home
+  if (!home) home = (await probeMachine(alias, { maxAgeMs: 24 * 3600_000 })).home
+  return home ? `${home}/.paper/run/${sessionId}.json` : runFile(sessionId)
+}
+
 /**
- * Issue (or re-issue after a restart) the token for a remote session, upload
- * the agent's MCP config to the remote (0600, `~/.paper/run/<sessionId>.json`)
- * and return its remote path for `claude --mcp-config <path>`.
+ * Make sure a remote session has a working token, and return its MCP config
+ * path for `claude --mcp-config <path>` plus the tunnel's remote port.
+ *
+ * Idempotent across Paper restarts: a running agent read its config once, at
+ * launch, and holds that token in memory — so when a hash for (sessionId,
+ * alias) is still on file *and* the remote config still exists, nothing is
+ * rewritten and the same token keeps working (only the tunnel is ensured).
+ * Otherwise (no hash, file gone, session moved to another machine, or tokens
+ * revoked by a port rotation) a fresh token is issued and uploaded (0600,
+ * atomic) and `rotated` is true: a process that is already running cannot see
+ * it and needs a restart to regain Paper tools.
  * The config is `{"mcpServers":{"paper":{"type":"http","url":"http://127.0.0.1:<remotePort>/mcp","headers":{"Authorization":"Bearer <token>"}}}}`.
  */
-export async function provisionRemoteSession(sessionId: string, alias: string): Promise<{ mcpConfigPath: string; remotePort: number }> {
+export async function provisionRemoteSession(
+  sessionId: string,
+  alias: string
+): Promise<{ mcpConfigPath: string; remotePort: number; rotated: boolean }> {
   if (!SESSION_ID_RE.test(sessionId)) throw new Error(`invalid session id ${sessionId}`)
   requireMachine(alias)
+  // Tunnel first: if it has to move to a new port, it revokes this machine's tokens, which forces a rotation below.
   const tunnel = await ensureTunnel(alias)
   const remotePort = getMachine(alias)?.remotePort
   if (!remotePort) throw new MachineFailure(tunnel.error ?? { kind: 'unknown', message: `no tunnel port for ${alias}`, hint: 'See gateway_status.' })
+
+  if (tokens.some((t) => t.sessionId === sessionId && t.host === alias)) {
+    const run = await sshRaw(alias, plainCommand(`[ -f ${remotePath(runFile(sessionId))} ]`), { timeoutMs: 15_000 })
+    // Cannot tell (ssh failed): refuse rather than rotate a token a live agent may still be using.
+    const failure = classify(alias, run)
+    if (failure) throw new MachineFailure(failure)
+    if (run.code === 0) return { mcpConfigPath: await absoluteRunFile(alias, sessionId), remotePort, rotated: false }
+  }
 
   revokeWhere((t) => t.sessionId === sessionId)
   const token = randomBytes(32).toString('base64url')
@@ -553,10 +579,7 @@ export async function provisionRemoteSession(sessionId: string, alias: string): 
     rmSync(tmp, { force: true })
   }
 
-  let home = getMachine(alias)?.probe?.home
-  if (!home) home = (await probeMachine(alias, { maxAgeMs: 24 * 3600_000 })).home
-  const mcpConfigPath = home ? `${home}/.paper/run/${sessionId}.json` : runFile(sessionId)
-  return { mcpConfigPath, remotePort }
+  return { mcpConfigPath: await absoluteRunFile(alias, sessionId), remotePort, rotated: true }
 }
 
 /** Revoke a session's token and delete its remote config (session closed or handed off elsewhere). */
