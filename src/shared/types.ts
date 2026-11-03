@@ -325,6 +325,8 @@ export interface ToolResult {
 export interface MainEvents {
   'pty:data': { sessionId: string; data: string }
   'pty:exit': { sessionId: string; exitCode: number }
+  /** The session was closed and forgotten by main; drop it from the UI. */
+  'session:closed': { sessionId: string }
   'session:update': SessionMeta
   'usage:update': UsageSnapshot
   'accounts:update': Account[]

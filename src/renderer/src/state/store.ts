@@ -824,6 +824,18 @@ function bind(): void {
       const meta = get().sessions[sessionId]
       if (meta) set((s) => ({ sessions: { ...s.sessions, [sessionId]: { ...meta, status: 'exited' } } }))
     }),
+    api.onSessionClosed(({ sessionId }) => {
+      if (!get().sessions[sessionId]) return
+      set((s) => {
+        const sessions = { ...s.sessions }
+        delete sessions[sessionId]
+        const usage = { ...s.usage }
+        delete usage[sessionId]
+        // Panes that showed it fall back to an empty terminal slot, exactly as after a restart.
+        const live = new Set(Object.keys(sessions))
+        return { sessions, usage, tabs: s.tabs.map((t) => ({ ...t, root: pruneSessions(t.root, live) })) }
+      })
+    }),
     api.onHot(({ generation }) => get().notify(`main process reloaded · generation ${generation}`)),
     ...(fakesOn()
       ? [fake.onSession(onSession), fake.onHandoff(onHandoff), fake.onMachines(onMachines), fake.onInventory(onInventory)]

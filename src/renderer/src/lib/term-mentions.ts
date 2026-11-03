@@ -179,15 +179,92 @@ export class MentionHighlighter {
   private clear(): void {
     for (const { marker, deco } of this.live.values()) { deco?.dispose(); marker.dispose() }
     this.live.clear()
+    this.clearOverlay()
+  }
+
+  /** Tags drawn over the alternate screen, keyed like `live` (row:x:width). */
+  private overlay: HTMLDivElement | null = null
+  private overlayKeys = ''
+
+  private clearOverlay(): void {
+    if (this.overlay) this.overlay.replaceChildren()
+    this.overlayKeys = ''
+  }
+
+  /**
+   * The alternate screen has no markers, so decorations cannot live there —
+   * and Claude Code draws its whole UI in it. Instead, lay cell-aligned tags
+   * over the screen: an opaque tinted box per match with the alias re-drawn in
+   * blue, one character per cell so it lines up with the glyphs underneath.
+   * pointer-events:none, so clicks fall through to the link provider.
+   */
+  private paintAlternate(matches: { row: number; x: number; width: number; text: string }[]): void {
+    const term = this.term
+    const screen = term.element?.querySelector('.xterm-screen') as HTMLElement | null
+    if (!screen) return
+    const keys = matches.map((m) => `${m.row}:${m.x}:${m.width}:${m.text}`).join('|')
+    if (keys === this.overlayKeys && this.overlay?.isConnected) return
+    if (!this.overlay || !this.overlay.isConnected) {
+      this.overlay = document.createElement('div')
+      this.overlay.className = 'paper-mention-overlay'
+      Object.assign(this.overlay.style, { position: 'absolute', inset: '0', pointerEvents: 'none', zIndex: '7' })
+      screen.appendChild(this.overlay)
+    }
+    this.overlayKeys = keys
+    const { fg, bg } = this.colors()
+    const cellW = screen.clientWidth / term.cols
+    const cellH = screen.clientHeight / term.rows
+    const font = term.options
+    const nodes = matches.map((m) => {
+      const tag = document.createElement('div')
+      Object.assign(tag.style, {
+        position: 'absolute',
+        left: `${m.x * cellW}px`,
+        top: `${m.row * cellH}px`,
+        width: `${m.width * cellW}px`,
+        height: `${cellH}px`,
+        background: bg,
+        color: fg,
+        display: 'flex',
+        fontFamily: String(font.fontFamily ?? 'monospace'),
+        fontSize: `${font.fontSize ?? 12}px`,
+        lineHeight: `${cellH}px`,
+        borderRadius: '2px'
+      })
+      for (const ch of m.text) {
+        const c = document.createElement('span')
+        Object.assign(c.style, { width: `${cellW}px`, textAlign: 'center', flex: 'none' })
+        c.textContent = ch
+        tag.appendChild(c)
+      }
+      return tag
+    })
+    this.overlay.replaceChildren(...nodes)
   }
 
   private scan(): void {
     if (this.disposed) return
     const term = this.term
     const buf = term.buffer.active
-    // Decorations live on the normal buffer only; a full-screen program in
-    // the alternate screen still gets clickable links from the provider.
-    if (!this.regex || buf.type !== 'normal') { this.clear(); return }
+    if (!this.regex) { this.clear(); return }
+    if (buf.type !== 'normal') {
+      // Decorations need markers, which only the normal buffer has: overlay instead.
+      for (const { marker, deco } of this.live.values()) { deco?.dispose(); marker.dispose() }
+      this.live.clear()
+      const found: { row: number; x: number; width: number; text: string }[] = []
+      for (let row = 0; row < term.rows; row++) {
+        const line = buf.getLine(buf.viewportY + row)
+        if (!line || !line.translateToString(true).includes('@')) continue
+        const { text, colOf } = mapLine(line, term.cols)
+        for (const m of text.matchAll(this.regex)) {
+          const x = colOf[m.index!]
+          found.push({ row, x, width: colOf[m.index! + m[0].length] - x, text: m[0] })
+        }
+      }
+      this.paintAlternate(found)
+      return
+    }
+    this.clearOverlay()
     const { fg, bg } = this.colors()
     const seen = new Set<string>()
     for (let row = 0; row < term.rows; row++) {

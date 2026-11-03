@@ -96,6 +96,7 @@ const api = {
 
   onPtyData: (fn: (p: { sessionId: string; data: string }) => void) => on('pty:data', fn),
   onPtyExit: (fn: (p: { sessionId: string; exitCode: number }) => void) => on('pty:exit', fn),
+  onSessionClosed: (fn: (p: { sessionId: string }) => void) => on('session:closed', fn),
   onSession: (fn: (m: SessionMeta) => void) => on('session:update', fn),
   onUsage: (fn: (u: UsageSnapshot) => void) => on('usage:update', fn),
   onAccounts: (fn: (a: Account[]) => void) => on('accounts:update', fn),

@@ -33,6 +33,9 @@ function broadcast(channel: string, payload: unknown): void {
 export function wireEvents(): () => void {
   sessionManager.on('data', (p) => broadcast('pty:data', p))
   sessionManager.on('exit', (p) => broadcast('pty:exit', p))
+  // A session can be closed from outside the window (a tool, an agent, a
+  // handoff cleanup); the UI must drop it rather than show a ghost.
+  sessionManager.on('closed', (sessionId: string) => broadcast('session:closed', { sessionId }))
   sessionManager.on('meta', (m) => broadcast('session:update', m))
   usageTracker.on('usage', (u) => broadcast('usage:update', u))
   usageTracker.on('title', ({ sessionId, title }) => titles.adoptNative(sessionId, title))
