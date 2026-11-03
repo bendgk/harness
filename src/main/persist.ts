@@ -339,7 +339,8 @@ function restoreOne(r: PersistedSession): RestoreReport['sessions'][number] {
   if (meta.remote) meta.remote = { ...meta.remote, link: 'connecting' }
   const base = { id: meta.id, provider: meta.provider, host: meta.host }
 
-  if (meta.provider === 'shell') return restoreShell(r, meta, wasExited, base)
+  // A remote shell lives in tmux like a remote agent: re-attach, never restart it here.
+  if (meta.provider === 'shell' && isLocal(meta)) return restoreShell(r, meta, wasExited, base)
 
   const session = sessionManager.insert(meta, { cols: r.cols, rows: r.rows })
   const exited = (why: string): RestoreReport['sessions'][number] => {

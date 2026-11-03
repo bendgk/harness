@@ -39,12 +39,13 @@ src/main/index.ts        KERNEL. Window, PTY registry (slots), MCP listener sock
 src/main/app.ts          HOT ENTRY. activate() attaches this generation to the kernel; dispose() detaches.
 src/main/kernel.ts       The Kernel / HotModule contract and the kernel() accessor.
 src/main/sessions.ts     SessionManager over node-pty. The session Map is a kernel slot; adopt()/detach() rebind
-                         pty listeners across generations.
+                         pty listeners across generations. Remote sessions: launch, link supervision, adopt.
+src/main/remote.ts       tmux-on-a-machine commands (launch, has/kill-session, @paper_* tags, rollout discovery).
 src/main/ipc.ts          IPC handlers (returns a disposer), event wiring, the usage/handoff/title services.
 src/main/providers/      claude, codex, shell: argv/env planning, transcript parsing, transplant for handoff.
 src/main/accounts.ts     Isolated CLI homes under ~/.paper/accounts/<id>; keychain import; identity display.
-src/main/handoff.ts      Account switch and directory retarget with the conversation intact.
-src/main/usage.ts        Transcript polling → UsageSnapshot (tracks in a kernel slot).
+src/main/handoff.ts      Account switch, directory retarget and machine handoff with the conversation intact.
+src/main/usage.ts        Transcript polling → UsageSnapshot (tracks in a kernel slot); mirrors remote transcripts.
 src/main/titles.ts       Tab naming: native ai-title, one-shot model call, keyword fallback.
 src/main/store.ts        ~/.paper/state.json (tabs, defaults, widgets, recent dirs, accounts, machines).
 src/main/ssh.ts          The ONLY module that spawns ssh: alias validation, quoting, BatchMode/multiplexed options,
@@ -65,7 +66,8 @@ scripts/sync-tools.mjs   Regenerates the Tools section of this file from the reg
 ```
 
 Runtime data: `~/.paper/` (`state.json`, `sessions.json`, `scrollback/<id>.log`, `accounts/<id>/`, `logs/`,
-`mcp.json`, `shots/`, `ssh/` control sockets, `gateway-tokens.json`, `run/` scratch). Override with `PAPER_HOME`.
+`mcp.json`, `shots/`, `ssh/` control sockets, `gateway-tokens.json`, `run/` scratch, `remote/<alias>/` transcript
+mirrors). Override with `PAPER_HOME`.
 
 ### The kernel / hot-bundle split
 
@@ -280,11 +282,106 @@ Testing machine code: `machines.ts` imports `electron` and `./sessions`; bundle 
 to a stub with `list()`, and set `PAPER_HOME` to a scratch dir (it also isolates the ControlMaster, which matters
 when testing auth failures — a warm master would still authenticate).
 
+## Remote sessions & machine handoff
+
+A session whose `meta.host` is a machine alias runs its CLI **in tmux on that machine**; Paper's pane is only an ssh
+client attached to it. `src/main/remote.ts` holds the tmux/ssh commands, `sessions.ts` the runtime (`startRemote`,
+link supervision), `handoff.ts` the moves (`toMachine`), `usage.ts` the transcript mirror.
+
+**Launch** (`start()` with `host !== 'local'` → `startRemote`, async; status `starting`, `remote.link` `connecting`,
+progress as dim notices in the pane): `ensureReady(alias, provider)` → for Claude, the gateway (`ensureTunnel`,
+`provisionRemoteSession`; failure → a notice "Paper tools unavailable", the agent still starts) → the provider's
+`remotePlan()` (argv only: no local `CLAUDE_CONFIG_DIR`, no local `--mcp-config`; Claude gets `--session-id`/`--resume`,
+`--mcp-config <remote 0600 gateway config>`, `--append-system-prompt <machine context>`) → one login-shell ssh
+(`launchRemote`) that:
+- checks `cd <cwd>` (exit 4 → `remote-dir`), `tmux` (5) and the CLI (6) on the login PATH (`missing-tool`),
+- writes the argv to a private launcher `~/.paper/run/<name>.sh` (umask 077, via stdin; it `rm`s itself before
+  `exec`). tmux refuses commands over ~16 KB ("command too long"), and prompts/briefs can exceed that,
+- runs `tmux -L paper -f /dev/null start-server ; set -s escape-time 0 ; set -g history-limit 50000 ; status off ;
+  mouse off ; default-terminal tmux-256color|screen-256color (whichever has terminfo there) ; set -s
+  terminal-overrides ',*:Tc:smcup@:rmcup@' ; remain-on-exit off ; window-size latest ; set-titles off ;
+  focus-events on ; new-session -d -s paper-<12 hex of id> -x C -y R -c <physical cwd> -- /bin/sh <launcher> <bin>`.
+  Options go in before the session exists (history-limit and default-terminal only apply to new panes).
+  `escape-time 0` because ESC is Claude's interrupt; `smcup@/rmcup@` so output scrolls into Paper's own scrollback.
+  `-L paper` + `-f /dev/null`: a private server the user's tmux config can neither break nor see.
+- tags the session with `@paper_id/@paper_provider/@paper_native/@paper_cwd/@paper_title` (title and native id are
+  re-tagged on change via `patchMeta`), so the machine itself says what runs there (inventory, adopt).
+- prints the physical cwd (`pwd -P`), which becomes `meta.cwd` (Claude slugs its project dir from it).
+
+Then the local pty is `ssh <sessionOptions> -tt -- <alias> exec $SHELL -lc 'exec tmux -L paper attach-session -t
+=<name>'` (`interactiveArgs`; own connection, BatchMode, `-e none`, no port forwards). `-t =name` is an exact match
+(bare names are prefixes); `set-option`/`display-message` need `=name:`. Resize goes through ssh to tmux;
+`write`/`interrupt` go through the pty as for local sessions. Env inside: `COLORTERM`, `PAPER_SESSION`, `PAPER_HOST`
+(never the gateway token — that lives only in the 0600 config file).
+
+**What survives what.**
+
+| Event | Remote agent | Paper side |
+|---|---|---|
+| ssh link drops / Mac sleeps | keeps running in tmux | `has-session` check → re-attach at once; repeated drops back off 1 s → 30 s (jittered), `link: reconnecting` |
+| auth / host-key failure while reconnecting | keeps running | `link: lost`, hint in the pane, no retries; ⌘R / `session_restart` re-attaches |
+| Paper quits or crashes (`disposeAll`, `kill`) | keeps running | only the local ssh client dies; restore (persist.ts) calls `start({ resume, reattach: true })` |
+| agent exits (`/exit`) | tmux session ends (`remain-on-exit off`) | `has-session` = gone → status `exited`; ⌘R relaunches with resume |
+| user closes the session (`close`, `session_close`) | `tmux kill-session` + gateway token revoked | record dropped |
+| ⌘R on an attached session | killed and relaunched with `--resume` (same tmux name) | — |
+
+`start({ reattach: true })`: attach if `tmux has-session` says alive, else relaunch resuming the conversation (a
+Claude `--resume` of a transcript that does not exist yet becomes `--session-id <same id>`). Async work outlives hot
+swaps safely: continuations go through the live manager (`kernel slot sessions.live`), reconnect timers are cleared in
+`detach()` and re-armed in `adopt()`, and `RemoteLink.gen` cancels stale launches after kill/restart/handoff.
+`machines:adopt` / `machine_adopt { alias, tmux }` bring a `paper-*` tmux session found on a machine (no live session
+attached) into Paper from its tags (reusing `@paper_id` when free) and re-attach. Every launch, close, handoff and
+re-attach emits `machineEvents 'poke'`.
+
+**Usage on remotes.** `usage.ts` mirrors the remote transcript into `~/.paper/remote/<alias>/<nativeId>.jsonl`
+(0600, dirs 0700) with `download(alias, path, offset = cache size)` — only new bytes cross the wire — every 4 s while
+working, 20 s idle, and only while `link === 'attached'`. `meta.transcriptPath` points at the mirror, so the
+UsageTracker, titles and naming work unchanged; `meta.remote.transcriptPath` is the path on the machine (Claude:
+`<claudeHome>/projects/<slug(cwd)>/<id>.jsonl`; Codex: newest `rollout-*.jsonl` under `<codexHome>/sessions` since
+launch, excluding others' — found by `findRemoteRollout`, its uuid becomes `nativeSessionId`). `reconcile()` (ps)
+skips remote sessions — their local pid is ssh.
+
+**Machine handoff** (`HandoffService.toMachine`, IPC `handoff:machine`, tool `session_handoff`): local→remote,
+remote→local, remote→remote (relayed through a local 0600 temp file, deleted after).
+1. *Preflight, source untouched*: the source machine is reachable (`ensureReady`), the target is ready (`ensureReady`
+   / local CLI + account), and the target directory resolves: `req.cwd` → `machine.defaultCwd` → the same absolute
+   path → the `$HOME`-relative equivalent (`/Users/me/work/x` → `~/work/x`) → else `remote-dir` "pick a directory".
+   New remote sessions without a directory use the same chain but end in `~` instead of failing.
+2. Interrupt, mark `handoff`, stop the source (local: SIGTERM; remote: `tmux kill-session` + revoke its token).
+3. Final transcript: local file, or a full `download` of the remote one.
+4. Transplant: local → the account home under `projectSlug(targetCwd)` (provider `transplant`); remote → `upload`
+   to `<claudeHome>/projects/<slug>/<id>.jsonl` or `<codexHome>/sessions/YYYY/MM/DD/<rollout name>`. A remote
+   target's local mirror is seeded with the same bytes.
+5. Relaunch on the target with resume; `meta.host/cwd/remote/lineage(host)` updated; notice
+   `↪ handed off to @alias · context preserved`. `continuePrompt` is passed as the CLI's **initial prompt argument**,
+   not typed: a resumed Claude may first show "trust this folder?" (default *No, exit*) and keystrokes would answer it.
+6. Any failure after step 2 rolls back: kill whatever started on the target, restore meta, relaunch the source where it
+   was with resume, and report. Progress goes out on `handoff:progress` naming the target (`@g6e` / `this Mac`); a
+   failure's `error` is `"<message>\n<hint>"`.
+Shell sessions just get a fresh shell in the target directory. `retarget` of a remote agent is a handoff within that
+machine; `switchAccount` refuses remote sessions (they use the machine's own login).
+
+**Self-handoff.** An agent moving itself (`session_handoff` with its own `$PAPER_SESSION`, locally or through the
+gateway) must not be killed inside its own tool call. If the session is `working` (or `starting`) the tool returns
+"scheduled" at once and `scheduleToMachine` waits for 2.5 s of `idle` (10 min cap, then reports), then runs the move
+with a default continue prompt ("You have been handed off to … in {cwd}. Continue the task …"; `{cwd}` is filled in
+after the directory is resolved). From a machine with `allowAgentHandoffToLocal: false`, moving to `local` is refused.
+
+**Codex and Paper tools.** Remote Codex runs without Paper tools: its HTTP MCP auth takes the bearer token from argv
+(`-c …http_headers`) or an env var (`bearer_token_env_var`/`env_http_headers`), and the token must be in neither;
+`http_headers_helper` exists in codex 0.163 but not in 0.144 (g6e). Codex *does* get the machine context, via
+`-c developer_instructions=<JSON string>` (verified on 0.144 and 0.163; a JSON string is a valid TOML basic string).
+
+**Testing remote code.** Scratch-bundle `remote.ts` with esbuild (`--alias:electron=<fake> --alias:@shared=./src/shared
+--external:node-pty`) and point it at a real machine; for live tests run an isolated instance with its own
+`PAPER_HOME`/ports and `SSH_AUTH_SOCK` in its env, drive it over MCP, and clean up `tmux -L paper` sessions,
+`~/.paper/run/*` and uploaded transcripts on the machine afterwards.
+
 ## Tools
 
 <!-- tools:begin (generated by `npm run tools:sync`; do not edit by hand) -->
 
-41 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
+43 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
 
 ### Instance
 
@@ -319,7 +416,7 @@ The PTY sessions Paper runs: agents and shells.
 
 #### `sessions_list` · read-only
 
-Every live session (agent or shell) with id, provider, account, cwd, status (starting/working/idle/exited/handoff), title and usage totals. `restoredAt` is set on sessions brought back after Paper restarted. Session ids are what every other session_* tool takes.
+Every live session (agent or shell) with id, provider, account, host ("local" or the machine alias it runs on), cwd, status (starting/working/idle/exited/handoff), link (remote sessions: connecting/attached/reconnecting/lost), title and usage totals. `restoredAt` is set on sessions brought back after Paper restarted. Session ids are what every other session_* tool takes.
 
 _No parameters._
 
@@ -342,15 +439,16 @@ The tail of a session's terminal output. ANSI escapes are stripped by default so
 
 #### `session_spawn`
 
-Start a Claude Code, Codex or shell session. `where` controls the UI: "tab" opens a new tab, "pane" fills the focused pane, "headless" runs it without a pane (still inspectable via session_read). Returns the session meta.
+Start a Claude Code, Codex or shell session, on this computer or on a registered machine (`host`). On a machine the agent runs in tmux there and keeps working if Paper disconnects or quits. `where` controls the UI: "tab" opens a new tab, "pane" fills the focused pane, "headless" runs it without a pane (still inspectable via session_read). Returns the session meta (a remote session starts as status "starting", link "connecting").
 
 | param | type | | description |
 |---|---|---|---|
 | `provider` | "claude" \| "codex" \| "shell" | required | Which harness to run |
-| `cwd` | string | optional | Working directory; defaults to the app default |
+| `cwd` | string | optional | Working directory; defaults to the app default (on a machine: its default directory, else ~) |
 | `account_id` | string | optional | Account to run under (accounts_list); default account otherwise |
 | `prompt` | string | optional | Initial prompt typed into an agent, or a command for a shell |
 | `where` | "tab" \| "pane" \| "headless" | default `"tab"` | Where the session appears |
+| `host` | string | default `"local"` | Where the agent runs: "local" (this computer) or a registered machine alias, e.g. "g6e" |
 
 #### `session_write`
 
@@ -381,7 +479,7 @@ Send the provider's interrupt sequence (ESC for agents, Ctrl-C for shells) witho
 
 #### `session_restart`
 
-Relaunch the CLI in place, resuming the same conversation (⌘R).
+Relaunch the CLI in place, resuming the same conversation (⌘R). For a session on a machine whose link dropped or failed, this reconnects to the still-running agent instead, relaunching (with resume) only if it is gone.
 
 | param | type | | description |
 |---|---|---|---|
@@ -389,11 +487,31 @@ Relaunch the CLI in place, resuming the same conversation (⌘R).
 
 #### `session_close`
 
-Kill the process and forget the session. The pane showing it (if any) reports it as exited.
+Kill the process and forget the session. For a session on a machine this ends the agent there too (its tmux session). The pane showing it (if any) reports it as exited.
 
 | param | type | | description |
 |---|---|---|---|
 | `id` | string | required | Session id (from sessions_list) |
+
+#### `session_handoff`
+
+Hand a session off to a registered machine, or back to this computer (host "local"), with the conversation fully intact: the target is checked first, then the agent is stopped, its transcript moved and resumed there by id. If anything fails the session is resumed where it was. An agent may move ITSELF (id = $PAPER_SESSION): while the session is working the call returns "scheduled" at once and the move happens when the current turn ends, then `continue_prompt` (default: a note to carry on with the task) is typed into the resumed agent. A shell just opens a fresh shell on the target.
+
+| param | type | | description |
+|---|---|---|---|
+| `id` | string | required | Session id (from sessions_list) |
+| `host` | string | required | Where the agent runs: "local" (this computer) or a registered machine alias, e.g. "g6e" |
+| `cwd` | string | optional | Directory on the target. Default: the machine's default, else the same path, else the same path under $HOME |
+| `continue_prompt` | string | optional | Typed into the agent once it is running on the target |
+
+#### `machine_adopt`
+
+Bring an agent that is running in tmux on a registered machine (a "paper-*" session, e.g. from a Paper that restarted or another computer) into this Paper as a live session, re-attaching to it without restarting it. Returns the session meta.
+
+| param | type | | description |
+|---|---|---|---|
+| `alias` | string | required | Registered machine alias |
+| `tmux` | string | required | The tmux session name on that machine, e.g. "paper-1a2b3c4d5e6f" |
 
 #### `session_wait` · read-only
 
@@ -798,6 +916,12 @@ ui_eval { code: "window.__paper.store.getState().tabs.length" }
 
 ## Gotchas
 
+- **Terminal queries are not kept for replay.** `sessions.ts` strips DA/DSR/XTVERSION/DECRQM/OSC-colour *queries*
+  from the scrollback buffer (they still reach the pane live). A re-attaching pane replays the buffer into a fresh
+  xterm, which would answer every old query again, and the answers arrive as typed input — tmux queries on every
+  attach, so a remote shell got `1;2c0;276;0c` at its prompt after each page reload.
+- `session_write` sends text and `\r` in one write; a long line arrives at Claude's TUI as a *paste* and the Enter is
+  swallowed into it. Use `session_steer` (text, pause, Enter) to submit prompts.
 - `ipcMain.handle` throws on a duplicate channel; `registerIpc` removes first, but if you register a channel
   outside it, dispose it yourself or the next hot swap fails to activate (and rolls back).
 - `executeJavaScript` results must be JSON-serialisable; `ctx.evalInRenderer` serialises for you and turns

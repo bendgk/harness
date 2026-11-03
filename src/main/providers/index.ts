@@ -20,4 +20,4 @@ export function isAgent(id: ProviderId): boolean {
 export function providerFor(id: ProviderId): Provider {
   return providers[id]
 }
-export type { Provider, SpawnPlan, TranscriptRead } from './types'
+export type { Provider, RemotePlan, SpawnPlan, TranscriptRead } from './types'

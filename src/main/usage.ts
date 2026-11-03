@@ -1,13 +1,43 @@
 import { EventEmitter } from 'node:events'
 import { execFileSync } from 'node:child_process'
-import { existsSync, statSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import { providerFor } from './providers'
 import { getAccount } from './accounts'
 import { kernel } from './kernel'
-import type { SessionManager } from './sessions'
-import type { ProviderId, UsageSnapshot } from '@shared/types'
+import { PAPER_HOME } from './paths'
+import { download } from './ssh'
+import { probeMachine } from './machines'
+import { findRemoteRollout } from './remote'
+import { isRemote, type SessionManager } from './sessions'
+import type { ProviderId, SessionMeta, UsageSnapshot } from '@shared/types'
 
 const POLL_MS = 1000
+/** Remote transcripts cost an ssh round trip, so they are fetched far less often. */
+const REMOTE_WORKING_MS = 4000
+const REMOTE_IDLE_MS = 20_000
+
+/**
+ * Local mirror of a remote transcript: `~/.paper/remote/<alias>/<id>.jsonl`,
+ * append-only, private. Pointing `meta.transcriptPath` at it keeps usage,
+ * titles and naming working exactly as they do for local sessions.
+ */
+export function remoteCachePath(alias: string, nativeId: string): string {
+  const dir = join(PAPER_HOME, 'remote', alias)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  try { chmodSync(join(PAPER_HOME, 'remote'), 0o700); chmodSync(dir, 0o700) } catch { /* best effort */ }
+  return join(dir, `${basename(nativeId).replace(/\.jsonl$/, '')}.jsonl`)
+}
+
+interface RemotePoll {
+  lastAt: number
+  inflight: boolean
+}
+
+/** Codex rollout names end in the conversation's uuid. */
+function idFromRollout(path: string): string | undefined {
+  return /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path)?.[1]
+}
 /** Burn-rate samples retained for the sparkline (one per poll). */
 const BURN_SAMPLES = 90
 
@@ -44,6 +74,7 @@ interface Track {
 export class UsageTracker extends EventEmitter {
   // Kept in a kernel slot so burn history survives a hot swap of this module.
   private tracks = kernel().slot('usage.tracks', () => new Map<string, Track>())
+  private remotePolls = kernel().slot('usage.remote', () => new Map<string, RemotePoll>())
   private timer: NodeJS.Timeout | null = null
 
   constructor(private sessions: SessionManager) {
@@ -62,6 +93,7 @@ export class UsageTracker extends EventEmitter {
 
   forget(sessionId: string): void {
     this.tracks.delete(sessionId)
+    this.remotePolls.delete(sessionId)
   }
 
   snapshot(sessionId: string): UsageSnapshot | undefined {
@@ -84,7 +116,8 @@ export class UsageTracker extends EventEmitter {
   reconcile(): void {
     const live = this.sessions.list().flatMap((meta) => {
       const pid = this.sessions.get(meta.id)?.proc?.pid
-      return meta.provider === 'claude' && pid ? [{ meta, pid }] : []
+      // A remote session's local pid is ssh, whose argv says nothing about the conversation.
+      return meta.provider === 'claude' && pid && !isRemote(meta) ? [{ meta, pid }] : []
     })
     if (!live.length) return
 
@@ -133,13 +166,16 @@ export class UsageTracker extends EventEmitter {
     // Transcripts already bound to a live session; a fallback scan must not
     // hand one of them to a second session.
     const claimed = new Set(this.sessions.list().flatMap((m) => (m.transcriptPath ? [m.transcriptPath] : [])))
+    const claimedRemote = new Set(this.sessions.list().flatMap((m) => (m.remote?.transcriptPath ? [m.remote.transcriptPath] : [])))
     for (const meta of this.sessions.list()) {
       const provider = providerFor(meta.provider)
-      const account = getAccount(meta.accountId)
-      if (!account) continue
-
-      // Codex names its own rollout file, so keep looking until it appears.
-      if (!meta.transcriptPath || !existsSync(meta.transcriptPath)) {
+      if (isRemote(meta)) {
+        this.pollRemote(meta, claimedRemote)
+        if (!meta.transcriptPath || !existsSync(meta.transcriptPath)) continue
+      } else if (!meta.transcriptPath || !existsSync(meta.transcriptPath)) {
+        // Codex names its own rollout file, so keep looking until it appears.
+        const account = getAccount(meta.accountId)
+        if (!account) continue
         const session = this.sessions.get(meta.id)
         const found = provider.findTranscript({
           home: account.home,
@@ -197,6 +233,49 @@ export class UsageTracker extends EventEmitter {
       this.tracks.set(meta.id, next)
       this.emit('usage', next.snapshot)
     }
+  }
+
+  /**
+   * Mirror a remote transcript into the local cache, incrementally: only the
+   * bytes past what the cache already holds cross the wire. Runs only while
+   * the session's ssh link is attached (a dead link would just time out), and
+   * every few seconds while the agent works, rarely while it idles.
+   */
+  private pollRemote(meta: SessionMeta, claimed: Set<string>): void {
+    if (meta.provider === 'shell' || meta.remote?.link !== 'attached') return
+    const poll = this.remotePolls.get(meta.id) ?? { lastAt: 0, inflight: false }
+    this.remotePolls.set(meta.id, poll)
+    // Decided at check time, so a session that starts working is polled soon, not after the idle interval.
+    const every = meta.status === 'working' || meta.status === 'starting' ? REMOTE_WORKING_MS : REMOTE_IDLE_MS
+    if (poll.inflight || Date.now() - poll.lastAt < every) return
+    poll.inflight = true
+    const alias = meta.host
+    void (async () => {
+      let path = meta.remote?.transcriptPath
+      if (!path && meta.provider === 'codex') {
+        const probe = await probeMachine(alias, { maxAgeMs: 10 * 60_000 })
+        if (!probe.codexHome) return
+        const session = this.sessions.get(meta.id)
+        path = await findRemoteRollout(alias, probe.codexHome, session?.startedAt ?? meta.createdAt, meta.nativeSessionId, claimed)
+        if (!path || !meta.remote) return
+        claimed.add(path)
+        const nativeSessionId = meta.nativeSessionId || idFromRollout(path)
+        this.sessions.patchMeta(meta.id, { remote: { ...meta.remote, transcriptPath: path }, nativeSessionId })
+      }
+      if (!path) return
+      const id = meta.provider === 'claude' ? meta.nativeSessionId || basename(path) : idFromRollout(path) || basename(path)
+      const cache = remoteCachePath(alias, id)
+      let offset = 0
+      try { offset = statSync(cache).size } catch { /* first fetch */ }
+      const chunk = await download(alias, path, offset)
+      if (chunk && chunk.length) appendFileSync(cache, chunk, { mode: 0o600 })
+      if (existsSync(cache) && meta.transcriptPath !== cache) this.sessions.patchMeta(meta.id, { transcriptPath: cache })
+    })()
+      .catch(() => { /* the link watcher reports connection problems; usage just waits */ })
+      .finally(() => {
+        poll.inflight = false
+        poll.lastAt = Date.now()
+      })
   }
 
   private pushBurn(track: Track, delta: number, snapshot?: UsageSnapshot): void {

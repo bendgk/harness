@@ -3,6 +3,9 @@ import { defineTool } from './types'
 import type { ToolContext } from './types'
 
 const ID = z.string().describe('Session id (from sessions_list)')
+/** LOCAL_HOST, spelled out: tool modules import only zod and types. */
+const LOCAL = 'local'
+const HOST = z.string().describe('Where the agent runs: "local" (this computer) or a registered machine alias, e.g. "g6e"')
 
 const ESC = String.fromCharCode(27)
 const CSI = String.fromCharCode(155)
@@ -45,7 +48,8 @@ export const sessionTools = [
     name: 'sessions_list',
     title: 'List sessions',
     description:
-      'Every live session (agent or shell) with id, provider, account, cwd, status (starting/working/idle/exited/handoff), ' +
+      'Every live session (agent or shell) with id, provider, account, host ("local" or the machine alias it runs on), ' +
+      'cwd, status (starting/working/idle/exited/handoff), link (remote sessions: connecting/attached/reconnecting/lost), ' +
       'title and usage totals. `restoredAt` is set on sessions brought back after Paper restarted. ' +
       'Session ids are what every other session_* tool takes.',
     group: 'sessions',
@@ -55,6 +59,8 @@ export const sessionTools = [
         const u = ctx.usage.snapshot(m.id)
         return {
           ...m,
+          host: m.host || LOCAL,
+          link: m.remote?.link,
           usage: u ? { totalTokens: u.totalTokens, costUsd: u.costUsd, contextTokens: u.contextTokens, model: u.model } : undefined,
           alive: Boolean(ctx.sessions.get(m.id)?.proc)
         }
@@ -103,18 +109,36 @@ export const sessionTools = [
     name: 'session_spawn',
     title: 'Start a session',
     description:
-      'Start a Claude Code, Codex or shell session. `where` controls the UI: "tab" opens a new tab, "pane" fills the focused ' +
-      'pane, "headless" runs it without a pane (still inspectable via session_read). Returns the session meta.',
+      'Start a Claude Code, Codex or shell session, on this computer or on a registered machine (`host`). On a machine the ' +
+      'agent runs in tmux there and keeps working if Paper disconnects or quits. `where` controls the UI: "tab" opens a new ' +
+      'tab, "pane" fills the focused pane, "headless" runs it without a pane (still inspectable via session_read). ' +
+      'Returns the session meta (a remote session starts as status "starting", link "connecting").',
     group: 'sessions',
     input: {
       provider: z.enum(['claude', 'codex', 'shell']).describe('Which harness to run'),
-      cwd: z.string().optional().describe('Working directory; defaults to the app default'),
+      cwd: z.string().optional().describe('Working directory; defaults to the app default (on a machine: its default directory, else ~)'),
       account_id: z.string().optional().describe('Account to run under (accounts_list); default account otherwise'),
       prompt: z.string().optional().describe('Initial prompt typed into an agent, or a command for a shell'),
-      where: z.enum(['tab', 'pane', 'headless']).default('tab').describe('Where the session appears')
+      where: z.enum(['tab', 'pane', 'headless']).default('tab').describe('Where the session appears'),
+      host: HOST.default(LOCAL)
     },
     mutates: true,
     handler: async (args, ctx) => {
+      if (args.host !== LOCAL) {
+        // Main validates the alias against the registry; the renderer's spawn
+        // path is local-only, so start it here and put it in a pane after.
+        if (!ctx.machines.list().some((m) => m.alias === args.host)) {
+          throw new Error(`"${args.host}" is not a registered machine. Registered: ${ctx.machines.list().map((m) => m.alias).join(', ') || 'none'}`)
+        }
+        const meta = ctx.sessions.spawn({ provider: args.provider, cwd: args.cwd, accountId: args.account_id, prompt: args.prompt, host: args.host })
+        if (args.where !== 'headless') {
+          const fn = args.where === 'tab' ? 'await s.newTab(); s = window.__paper.store.getState();' : ''
+          await ctx.evalInRenderer(
+            `let s = window.__paper.store.getState(); ${fn} const t = s.activeTab(); if (t) s.attachSession(t.focusedPaneId, ${JSON.stringify(meta.id)}); return true`
+          )
+        }
+        return { json: meta }
+      }
       const req = { provider: args.provider, cwd: args.cwd, accountId: args.account_id, prompt: args.prompt }
       if (args.where === 'headless') {
         const meta = ctx.sessions.spawn({ ...req, cwd: args.cwd || ctx.getState().defaults.cwd })
@@ -180,7 +204,9 @@ export const sessionTools = [
   defineTool({
     name: 'session_restart',
     title: 'Restart a session',
-    description: 'Relaunch the CLI in place, resuming the same conversation (⌘R).',
+    description:
+      'Relaunch the CLI in place, resuming the same conversation (⌘R). For a session on a machine whose link dropped or ' +
+      'failed, this reconnects to the still-running agent instead, relaunching (with resume) only if it is gone.',
     group: 'sessions',
     input: { id: ID },
     mutates: true,
@@ -194,7 +220,9 @@ export const sessionTools = [
   defineTool({
     name: 'session_close',
     title: 'Close a session',
-    description: 'Kill the process and forget the session. The pane showing it (if any) reports it as exited.',
+    description:
+      'Kill the process and forget the session. For a session on a machine this ends the agent there too (its tmux ' +
+      'session). The pane showing it (if any) reports it as exited.',
     group: 'sessions',
     input: { id: ID },
     mutates: true,
@@ -204,6 +232,73 @@ export const sessionTools = [
       ctx.usage.forget(args.id)
       ctx.titles.forget(args.id)
       return { text: 'closed' }
+    }
+  }),
+
+  defineTool({
+    name: 'session_handoff',
+    title: 'Move a session to another computer',
+    description:
+      'Hand a session off to a registered machine, or back to this computer (host "local"), with the conversation fully ' +
+      'intact: the target is checked first, then the agent is stopped, its transcript moved and resumed there by id. ' +
+      'If anything fails the session is resumed where it was. An agent may move ITSELF (id = $PAPER_SESSION): while the ' +
+      'session is working the call returns "scheduled" at once and the move happens when the current turn ends, then ' +
+      '`continue_prompt` (default: a note to carry on with the task) is typed into the resumed agent. A shell just opens ' +
+      'a fresh shell on the target.',
+    group: 'sessions',
+    input: {
+      id: ID,
+      host: HOST,
+      cwd: z.string().optional().describe('Directory on the target. Default: the machine\'s default, else the same path, else the same path under $HOME'),
+      continue_prompt: z.string().optional().describe('Typed into the agent once it is running on the target')
+    },
+    mutates: true,
+    handler: async (args, ctx) => {
+      const s = requireSession(ctx, args.id)
+      const host = args.host || LOCAL
+      if (host !== LOCAL && !ctx.machines.list().some((m) => m.alias === host)) {
+        throw new Error(`"${host}" is not a registered machine`)
+      }
+      const where = host === LOCAL ? "the user's computer" : host
+      // A working session is (almost always) the caller handing itself off:
+      // stopping it now would kill the agent inside this very tool call.
+      if (s.meta.status === 'working' || s.meta.status === 'starting') {
+        if (host === LOCAL && s.meta.host && s.meta.host !== LOCAL) {
+          const m = ctx.machines.list().find((x) => x.alias === s.meta.host)
+          if (m?.allowAgentHandoffToLocal === false) {
+            throw new Error(`Agents on ${s.meta.host} are not allowed to move themselves to the user's computer (machine setting).`)
+          }
+        }
+        const continuePrompt = args.continue_prompt ??
+          `You have been handed off to ${where} and are now running there in {cwd}. Continue the task you were working on.`
+        ctx.handoff.scheduleToMachine({ sessionId: args.id, host, cwd: args.cwd, continuePrompt })
+        return {
+          text: `scheduled: this session moves to ${where} as soon as its current turn ends (end your turn now). ` +
+            'The conversation resumes there with full context.'
+        }
+      }
+      await ctx.handoff.toMachine({ sessionId: args.id, host, cwd: args.cwd, continuePrompt: args.continue_prompt })
+      const meta = ctx.sessions.meta(args.id)
+      return { json: meta }
+    }
+  }),
+
+  defineTool({
+    name: 'machine_adopt',
+    title: 'Adopt an agent running on a machine',
+    description:
+      'Bring an agent that is running in tmux on a registered machine (a "paper-*" session, e.g. from a Paper that ' +
+      'restarted or another computer) into this Paper as a live session, re-attaching to it without restarting it. ' +
+      'Returns the session meta.',
+    group: 'sessions',
+    input: {
+      alias: z.string().describe('Registered machine alias'),
+      tmux: z.string().describe('The tmux session name on that machine, e.g. "paper-1a2b3c4d5e6f"')
+    },
+    mutates: true,
+    handler: async (args, ctx) => {
+      if (!/^paper-[0-9a-f]{6,32}$/.test(args.tmux)) throw new Error(`"${args.tmux}" is not a Paper tmux session name`)
+      return { json: await ctx.sessions.adoptRemote(args.alias, args.tmux) }
     }
   }),
 

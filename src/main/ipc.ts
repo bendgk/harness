@@ -17,7 +17,7 @@ import {
   updateMachine, type MachineInput
 } from './machines'
 import { shutdownGateway, startGateway } from './gateway'
-import type { AgentProviderId, AppSnapshot, SpawnRequest, Tab } from '@shared/types'
+import { LOCAL_HOST, type AgentProviderId, type AppSnapshot, type MachineHandoffRequest, type SpawnRequest, type Tab } from '@shared/types'
 
 export const usageTracker = new UsageTracker(sessionManager)
 export const handoff = new HandoffService(sessionManager, usageTracker)
@@ -175,6 +175,10 @@ export function registerIpc(): () => void {
 
   // ---- sessions -----------------------------------------------------------
   handle('session:spawn', (req: SpawnRequest) => {
+    // A remote session's directory is a path on that machine: no local default,
+    // and it must not become the local default either. spawn() picks the
+    // machine's defaultCwd (or ~) when none is given.
+    if (req.host && req.host !== LOCAL_HOST) return sessionManager.spawn(req)
     const cwd = req.cwd || getState().defaults.cwd
     if (req.cwd && existsSync(req.cwd)) saveState({ defaults: { ...getState().defaults, cwd: req.cwd } })
     return sessionManager.spawn({ ...req, cwd })
@@ -201,6 +205,8 @@ export function registerIpc(): () => void {
   handle('usage:get', (id: string) => usageTracker.snapshot(id))
   handle('usage:all', () => usageTracker.all())
   handle('handoff:switch', (sessionId: string, accountId: string) => handoff.switchAccount(sessionId, accountId))
+  handle('handoff:machine', (req: MachineHandoffRequest) => handoff.toMachine(req))
+  handle('machines:adopt', (alias: string, tmux: string) => sessionManager.adoptRemote(alias, tmux))
   handle('session:retarget', (sessionId: string, cwd: string) => {
     rememberDir(cwd)
     saveState({ defaults: { ...getState().defaults, cwd } })

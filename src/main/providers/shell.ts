@@ -1,5 +1,5 @@
 import { basename } from 'node:path'
-import type { Provider, SpawnPlan, TranscriptRead } from './types'
+import type { Provider, RemotePlan, SpawnPlan, TranscriptRead } from './types'
 
 /**
  * A plain login shell. It has no account, no transcript and no usage — it is
@@ -23,6 +23,11 @@ export const shellProvider: Provider = {
       transcriptPath: undefined,
       initialInput: prompt
     }
+  },
+
+  remotePlan({ prompt }): RemotePlan {
+    // The remote user's own login shell, whatever it is.
+    return { bin: null, args: ['-l'], initialInput: prompt }
   },
 
   findTranscript(): string | undefined {

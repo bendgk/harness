@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, copyFileSync, readdirSync, statSyn
 import { join } from 'node:path'
 import { contextWindowFor, costOf } from '@shared/pricing'
 import { kernel } from '../kernel'
-import type { Provider, SpawnPlan, TranscriptRead } from './types'
+import type { Provider, RemotePlan, SpawnPlan, TranscriptRead } from './types'
 
 /** Claude Code encodes the cwd into the project folder name. */
 export function projectSlug(cwd: string): string {
@@ -21,7 +21,7 @@ export const claudeProvider: Provider = {
   homeEnv: 'CLAUDE_CONFIG_DIR',
   interruptSequence: '\x1b', // ESC cancels the turn but keeps the REPL alive
 
-  plan({ home, cwd, resume, prompt }): SpawnPlan {
+  plan({ home, cwd, resume, prompt, systemPrompt }): SpawnPlan {
     // Pinning the session id up front makes the transcript path deterministic,
     // so usage tracking starts with the very first token instead of racing a watcher.
     const id = resume || randomUUID()
@@ -32,6 +32,7 @@ export const claudeProvider: Provider = {
     if (process.env.PAPER_MCP !== '0' && kernel().mcp.url && existsSync(mcpConfig)) {
       args.push('--mcp-config', mcpConfig)
     }
+    if (systemPrompt) args.push('--append-system-prompt', systemPrompt)
     if (prompt) args.push(prompt)
     return {
       file: this.bin,
@@ -40,6 +41,20 @@ export const claudeProvider: Provider = {
       nativeSessionId: id,
       transcriptPath: join(projectDir(home, cwd), `${id}.jsonl`)
     }
+  },
+
+  remotePlan({ resume, prompt, systemPrompt, sessionId, mcpConfig }): RemotePlan {
+    // Same pinned id as locally, so the remote transcript path is predictable
+    // (<claudeHome>/projects/<slug>/<id>.jsonl) and resume works across hosts.
+    const id = resume || sessionId || randomUUID()
+    const args = resume ? ['--resume', id] : ['--session-id', id]
+    // The gateway config (a file on the remote holding the session's token —
+    // never argv or env). `--mcp-config` is variadic, so it must be followed
+    // by another option, not the prompt.
+    if (mcpConfig) args.push('--mcp-config', mcpConfig)
+    if (systemPrompt) args.push('--append-system-prompt', systemPrompt)
+    if (prompt) args.push(prompt)
+    return { bin: this.bin, args, nativeSessionId: id }
   },
 
   findTranscript({ home, cwd, since, nativeSessionId, exclude }): string | undefined {

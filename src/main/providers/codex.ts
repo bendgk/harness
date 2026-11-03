@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, copyFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { costOf } from '@shared/pricing'
-import type { Provider, SpawnPlan, TranscriptRead } from './types'
+import type { Provider, RemotePlan, SpawnPlan, TranscriptRead } from './types'
 import type { RateLimitWindow } from '@shared/types'
 
 /** Rollouts live at $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl */
@@ -32,6 +32,20 @@ function walkRollouts(home: string, sinceMs: number): string[] {
   return found.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
 }
 
+/**
+ * `-c developer_instructions=…` is Codex's supported way to add instructions
+ * for one run (verified on codex-cli 0.144 and 0.163). The value is parsed as
+ * TOML; a JSON string literal is a valid TOML basic string, so any text —
+ * quotes, newlines — arrives intact. It is a global option, so it goes before
+ * the `resume` subcommand.
+ */
+function codexArgs(resume?: string, prompt?: string, systemPrompt?: string): string[] {
+  const args = systemPrompt ? ['-c', `developer_instructions=${JSON.stringify(systemPrompt)}`] : []
+  if (resume) args.push('resume', resume)
+  if (prompt) args.push(prompt)
+  return args
+}
+
 export const codexProvider: Provider = {
   id: 'codex',
   name: 'Codex',
@@ -39,17 +53,19 @@ export const codexProvider: Provider = {
   homeEnv: 'CODEX_HOME',
   interruptSequence: '\x1b',
 
-  plan({ home, cwd, resume, prompt }): SpawnPlan {
+  plan({ home, resume, prompt, systemPrompt }): SpawnPlan {
     // Codex generates its own conversation id, so the transcript is discovered
     // by watching the rollout directory rather than predicted.
-    const args = resume ? ['resume', resume] : []
-    if (prompt) args.push(prompt)
     return {
       file: this.bin,
-      args,
+      args: codexArgs(resume, prompt, systemPrompt),
       env: { CODEX_HOME: home },
       nativeSessionId: resume
     }
+  },
+
+  remotePlan({ resume, prompt, systemPrompt }): RemotePlan {
+    return { bin: this.bin, args: codexArgs(resume, prompt, systemPrompt), nativeSessionId: resume }
   },
 
   findTranscript({ home, since, nativeSessionId, exclude }): string | undefined {
