@@ -10,6 +10,11 @@ export interface Persisted {
     provider: ProviderId
     cwd: string
     accountByProvider: Partial<Record<AgentProviderId, string>>
+    /**
+     * After a restart, tell an agent that was mid-turn to carry on (persist.ts).
+     * Absent means true: state files written before this field existed.
+     */
+    resumeNudge?: boolean
   }
   widgets: WidgetPrefs
   recentDirs: string[]
@@ -21,7 +26,7 @@ const EMPTY: Persisted = {
   accounts: [],
   tabs: [],
   activeTabId: null,
-  defaults: { provider: 'claude', cwd: process.env.HOME || '/', accountByProvider: {} },
+  defaults: { provider: 'claude', cwd: process.env.HOME || '/', accountByProvider: {}, resumeNudge: true },
   widgets: { enabled: ['usage', 'context', 'limits', 'burn', 'pet', 'clock'], petName: 'Inky' },
   recentDirs: [],
   machines: []
@@ -32,7 +37,9 @@ let state: Persisted = { ...EMPTY }
 export function loadState(): Persisted {
   ensureDirs()
   try {
-    state = { ...EMPTY, ...JSON.parse(readFileSync(STATE_FILE, 'utf8')) }
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    // Defaults merge one level deep so a field added later (resumeNudge) gets its default.
+    state = { ...EMPTY, ...saved, defaults: { ...EMPTY.defaults, ...saved?.defaults } }
   } catch {
     state = { ...EMPTY }
   }

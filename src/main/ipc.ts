@@ -1,6 +1,7 @@
 import { ipcMain, dialog, BrowserWindow, shell } from 'electron'
 import { existsSync } from 'node:fs'
 import { sessionManager } from './sessions'
+import { finalFlush } from './persist'
 import { UsageTracker } from './usage'
 import { HandoffService } from './handoff'
 import { TitleService } from './titles'
@@ -200,7 +201,14 @@ export function registerIpc(): () => void {
   }
 }
 
+/**
+ * Quit. Order matters: the session registry is written first, while every
+ * status is still the truth (then frozen, so the kills below never reach
+ * disk); local CLIs then get SIGTERM and ~1.2 s to flush their transcripts.
+ * Remote agents keep running in tmux — only their ssh clients go.
+ */
 export function shutdown(): void {
+  finalFlush()
   usageTracker.stop()
   titles.stop()
   sessionManager.disposeAll()

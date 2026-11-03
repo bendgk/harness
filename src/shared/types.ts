@@ -195,6 +195,8 @@ export interface AppSnapshot {
     provider: ProviderId
     cwd: string
     accountByProvider: Partial<Record<AgentProviderId, string>>
+    /** Nudge agents that were mid-turn when Paper died to continue (default true). */
+    resumeNudge?: boolean
   }
   widgets: WidgetPrefs
   /** Directories opened recently, most recent first. */

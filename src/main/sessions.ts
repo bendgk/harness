@@ -110,8 +110,33 @@ export class SessionManager extends EventEmitter {
     return meta
   }
 
-  /** Boot (or re-boot, after an account switch) the underlying CLI. */
-  start(session: Session, opts: { resume?: string; prompt?: string } = {}): void {
+  /**
+   * Put a session record back into the table without starting anything — the
+   * restore-after-restart path (persist.ts). The id is the one the record had,
+   * so tabs saved in state.json re-bind to it. The caller decides how to start it.
+   */
+  insert(meta: SessionMeta, init: { buffer?: string; cols?: number; rows?: number } = {}): Session {
+    const session: Session = {
+      meta,
+      proc: null,
+      buffer: init.buffer ?? '',
+      cols: init.cols || 120,
+      rows: init.rows || 34,
+      idleTimer: null,
+      startedAt: Date.now(),
+      subs: []
+    }
+    this.sessions.set(meta.id, session)
+    this.emit('meta', meta)
+    return session
+  }
+
+  /**
+   * Boot (or re-boot, after an account switch) the underlying CLI. `reattach`
+   * is for a remote session restored after a Paper restart: rejoin its tmux
+   * session if it still exists, else relaunch with `resume`.
+   */
+  start(session: Session, opts: { resume?: string; prompt?: string; reattach?: boolean } = {}): void {
     const { meta } = session
     const provider = providerFor(meta.provider)
     const account = isAgent(meta.provider) ? getAccount(meta.accountId) : undefined
@@ -293,6 +318,9 @@ export class SessionManager extends EventEmitter {
     const s = this.sessions.get(id)
     if (s?.idleTimer) clearTimeout(s.idleTimer)
     this.sessions.delete(id)
+    // An explicit close is the one thing that drops a session from the on-disk
+    // registry; persist.ts listens for it.
+    if (s) this.emit('closed', id)
   }
 
   /** Change a session's working directory in place. */
@@ -318,8 +346,25 @@ export class SessionManager extends EventEmitter {
     this.start(s, { resume: s.meta.nativeSessionId })
   }
 
-  disposeAll(): void {
-    for (const id of [...this.sessions.keys()]) this.close(id)
+  /**
+   * Paper is quitting. Unlike close(), this keeps every session's record (the
+   * registry was flushed before this runs) so the next launch brings it back.
+   * Local CLIs get SIGTERM and a short grace to flush their transcripts; a
+   * remote session's kill() only drops the local ssh client, so its agent
+   * keeps running in tmux. Blocks the quit for at most `graceMs`.
+   */
+  disposeAll(graceMs = 1200): void {
+    const pids: number[] = []
+    for (const [id, s] of this.sessions) {
+      if (s.proc?.pid) pids.push(s.proc.pid)
+      if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null }
+      this.kill(id, 'SIGTERM')
+    }
+    const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
+    const deadline = Date.now() + graceMs
+    // before-quit is synchronous, so the grace has to be a blocking wait.
+    while (pids.some(alive) && Date.now() < deadline) sleepSync(50)
+    for (const pid of pids.filter(alive)) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
   }
 
   countByAccount(accountId: string): number {
@@ -329,6 +374,11 @@ export class SessionManager extends EventEmitter {
   byProvider(provider: ProviderId): Session[] {
     return [...this.sessions.values()].filter((s) => s.meta.provider === provider)
   }
+}
+
+/** Block the thread; only for quit/boot paths where the event loop must not run. */
+export function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
 export function delay(ms: number): Promise<void> {

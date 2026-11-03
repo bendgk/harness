@@ -18,6 +18,7 @@ import type { UsageTracker } from '../usage'
 import type { TitleService } from '../titles'
 import type { HandoffService } from '../handoff'
 import type { Persisted } from '../store'
+import type { RestoreReport, SessionRegistry } from '../persist'
 import type { Account } from '@shared/types'
 
 export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state'
@@ -41,6 +42,12 @@ export interface ToolContext {
   getState(): Persisted
   saveState(patch: Partial<Persisted>): void
   accounts(): Account[]
+  /** The on-disk session registry (~/.paper/sessions.json) and the last boot's restore report. */
+  persistence: {
+    path: string
+    read(): SessionRegistry | null
+    report(): RestoreReport | null
+  }
   window(): BrowserWindow | null
   /** Run a menu command in the renderer, exactly as the keystroke would. */
   command(name: string): void

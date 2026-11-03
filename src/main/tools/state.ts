@@ -6,7 +6,8 @@ export const stateTools = [
     name: 'state_get',
     title: 'Persisted state',
     description:
-      'What Paper has saved to ~/.paper/state.json: saved tabs and pane layouts, defaults (provider, cwd, default account per provider), ' +
+      'What Paper has saved to ~/.paper/state.json: saved tabs and pane layouts, defaults (provider, cwd, default account per provider, ' +
+      'resumeNudge), ' +
       'widget prefs and recent directories. Accounts are listed via accounts_list.',
     group: 'state',
     input: { path: z.string().optional().describe('Dot path into the state, e.g. "defaults.cwd"') },
@@ -21,12 +22,15 @@ export const stateTools = [
   defineTool({
     name: 'state_set_defaults',
     title: 'Set defaults',
-    description: 'Change the default provider, working directory, or pinned account per provider for new sessions.',
+    description:
+      'Change the default provider, working directory, or pinned account per provider for new sessions, and whether agents ' +
+      'that were mid-turn when Paper died get a continuation prompt after the restart (resume_nudge).',
     group: 'state',
     input: {
       provider: z.enum(['claude', 'codex', 'shell']).optional(),
       cwd: z.string().optional().describe('Absolute directory'),
-      account_by_provider: z.record(z.string(), z.string()).optional().describe('e.g. {"claude": "<account id>"}')
+      account_by_provider: z.record(z.string(), z.string()).optional().describe('e.g. {"claude": "<account id>"}'),
+      resume_nudge: z.boolean().optional().describe('After a restart, tell agents that were working to continue where they left off (default true)')
     },
     mutates: true,
     handler: (args, ctx) => {
@@ -35,7 +39,8 @@ export const stateTools = [
         ...current,
         ...(args.provider ? { provider: args.provider } : {}),
         ...(args.cwd ? { cwd: args.cwd } : {}),
-        ...(args.account_by_provider ? { accountByProvider: { ...current.accountByProvider, ...args.account_by_provider } } : {})
+        ...(args.account_by_provider ? { accountByProvider: { ...current.accountByProvider, ...args.account_by_provider } } : {}),
+        ...(args.resume_nudge !== undefined ? { resumeNudge: args.resume_nudge } : {})
       }
       ctx.saveState({ defaults })
       return { json: defaults }

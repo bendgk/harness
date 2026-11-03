@@ -26,7 +26,8 @@ serves an MCP server so any agent can inspect and drive it. You are expected to 
    changed the kernel (see *What reloads how*).
 5. **Never break a live session.** Sessions live in kernel slots precisely so code changes cannot kill them. Do
    not move PTY handles or the session map out of `kernel().slot(...)`, and do not add work to `activate()` that
-   restarts or writes to sessions.
+   restarts or writes to sessions. (The one exception, restore-after-restart, is guarded by a kernel-slot flag so it
+   runs on the cold start only — see *Persistence & restore*.)
 6. **Match the codebase's voice.** Two-space indent, no semicolons, single quotes, `type` imports, comments that
    explain *why* (the existing files are the style guide). Small focused modules; no new frameworks.
 
@@ -46,6 +47,7 @@ src/main/handoff.ts      Account switch and directory retarget with the conversa
 src/main/usage.ts        Transcript polling → UsageSnapshot (tracks in a kernel slot).
 src/main/titles.ts       Tab naming: native ai-title, one-shot model call, keyword fallback.
 src/main/store.ts        ~/.paper/state.json (tabs, defaults, widgets, recent dirs, accounts).
+src/main/persist.ts      ~/.paper/sessions.json session registry + shell scrollback; restore-on-boot, orphan reaping.
 src/main/menu.ts         Application menu = the single source of shortcuts; sends `app:command` to the renderer.
 src/main/mcp.ts          MCP server (Streamable HTTP, stateless) over the tool registry.
 src/main/tools/          THE TOOL REGISTRY. types.ts (contract), app/sessions/ui/dev/state.ts (tools),
@@ -57,8 +59,8 @@ src/shared/              Types and pricing used by both sides.
 scripts/sync-tools.mjs   Regenerates the Tools section of this file from the registry.
 ```
 
-Runtime data: `~/.paper/` (`state.json`, `accounts/<id>/`, `logs/`, `mcp.json`, `shots/`). Override with
-`PAPER_HOME`.
+Runtime data: `~/.paper/` (`state.json`, `sessions.json`, `scrollback/<id>.log`, `accounts/<id>/`, `logs/`,
+`mcp.json`, `shots/`). Override with `PAPER_HOME`.
 
 ### The kernel / hot-bundle split
 
@@ -79,11 +81,59 @@ records the error in `hot_status`. Overlapping swaps are serialised.
 | `src/renderer/**` | Vite HMR (React Fast Refresh; store state carried across) | untouched | `ui_state`, `ui_screenshot`, `ui_console` |
 | `src/main/**` except `index.ts`, `src/shared/**` | esbuild rebuild → hot swap of the app bundle (~100 ms) | untouched, adopted by the new generation | `hot_wait`, then `hot_status`, `logs_main` |
 | `src/preload/index.ts` | esbuild rebuild → renderer page reload | untouched; panes re-attach | `hot_wait` (target preload), `ui_state` |
-| `src/main/index.ts` (kernel) | nothing until Electron restarts | die on restart | restart `npm run dev` |
-| `electron.vite.config.ts`, `package.json` deps | nothing until restart | die on restart | restart |
+| `src/main/index.ts` (kernel) | nothing until Electron restarts | local CLIs stop, then resume on relaunch | restart `npm run dev` |
+| `electron.vite.config.ts`, `package.json` deps | nothing until restart | local CLIs stop, then resume on relaunch | restart |
 
 A page reload (preload change, `ui_reload`, View ▸ Reload) is safe: `store.init()` keeps pane ↔ session links
 whose session is still alive in main and empties only the dead ones.
+
+### Persistence & restore
+
+Sessions survive Paper restarts. `src/main/persist.ts` keeps `~/.paper/sessions.json` (0600, atomic tmp+rename):
+
+```
+{ version: 1, savedAt, pid, quitAt?,           // quitAt only after a graceful quit; absent = crash
+  sessions: [{ meta: SessionMeta,              // full meta: id, provider, accountId, cwd, host, remote,
+                                               //   nativeSessionId, transcriptPath, title, lineage, createdAt…
+               wasWorking, lastActiveAt,       // status was `working` at the last write; last pty activity
+               cols, rows, liveCwd? }] }       // liveCwd: shells only, the shell's own cwd via lsof
+```
+
+- **Writes** are derived from the live session table, coalesced ~200 ms after any `meta`/`closed` event (never
+  starved by a busy pane), flushed synchronously in `dispose()` (hot swap) and first thing in `shutdown()` (quit).
+  The quit flush also freezes writing, so the exits caused by quitting never reach disk. Nothing is written until
+  the boot's restore has run, so an empty table can never overwrite the registry. An unreadable registry is moved
+  aside to `sessions.json.corrupt-<ts>`.
+- **Only `close()` forgets a session** (it emits `closed`; the record and its scrollback go). `disposeAll()` on quit
+  keeps records: local CLIs get SIGTERM and ≤1.2 s grace (blocking — before-quit is synchronous) to flush their
+  transcripts, then SIGKILL; a remote session's `kill()` only drops the local ssh client.
+- **Restore** (`restoreOnce()` in `activate()`) runs on the *first* activation per Electron process only — the
+  `kernel().slot('restore')` flag makes every hot swap skip it. The kernel activates before it creates the window,
+  so the renderer's first `app:snapshot` already holds the restored ids and `store.init()` keeps panes bound to
+  them. Per record (`meta.restoredAt` is set on all of them):
+  - local agent with a transcript → `start({ resume })`; if `wasWorking` and `defaults.resumeNudge` (default true),
+    once the CLI has sat idle ~2 s it is sent *"Paper restarted while you were working. Continue exactly where you
+    left off."*
+  - local agent never prompted (no transcript) → fresh start in the same cwd/account.
+  - remote session → `start({ resume, reattach: true })`; the remote runtime rejoins tmux or relaunches. Never dropped here.
+  - shell → new login shell in `liveCwd` (else `meta.cwd`, else `$HOME`), previous output from
+    `~/.paper/scrollback/<id>.log` (≤200 KB, 0600, written ~1 s after output) replayed dimmed + "restored ·
+    previous output above". Agents get no scrollback file: `--resume` redraws them, and it keeps secrets off disk.
+  - already exited, account deleted, cwd gone, CLI missing → shown `exited` with a notice saying why; boot goes on.
+  Status is never carried over: everything starts as `starting` (or `exited`) until the process reports.
+- **Orphans.** Before resuming, `ps -axo pid=,command=` is scanned for a process running one of the registry's
+  conversation ids *exactly* (`--session-id|--resume <id>` for Claude, `resume <id>` for Codex); one whose
+  environment names a different `PAPER_SESSION` is spared. Matches get SIGTERM, ≤1.5 s, then SIGKILL, so two
+  processes never write one transcript.
+- **Observe it:** `sessions_persisted` (registry + this boot's restore report and reaped orphans), `sessions_list`
+  (`restoredAt`), `logs_main { grep: '[persist]' }`, `state_set_defaults { resume_nudge }`.
+
+| Event | Local agents | Remote agents | Shells |
+|---|---|---|---|
+| Hot swap / page reload | untouched | untouched | untouched |
+| Paper quit (⌘Q, SIGTERM) | stop (SIGTERM); resumed on relaunch, same id/pane | keep running in tmux; reattached | stop; new shell + replayed output |
+| Crash / SIGKILL of Paper | die with their pty; resumed + nudged if mid-turn | keep running; reattached | as quit, scrollback ≤1 s stale |
+| Machine reboot | resumed from transcripts on next launch | tmux gone → relaunched with resume (remote runtime) | as quit |
 
 ### Working on Paper from inside Paper
 
@@ -94,8 +144,8 @@ is unaffected because it is a kernel slot, not app-bundle state. Claude sessions
 
 Two cautions:
 
-- A **kernel** change (`src/main/index.ts`) needs a restart, which kills every session in that instance — including
-  yours. Test kernel changes in a second instance: `npm run dev:isolated` runs Paper with its own state dir
+- A **kernel** change (`src/main/index.ts`) needs a restart, which stops every local session in that instance —
+  including yours. They come back (resumed) on relaunch, but the turn in flight is cut off. Test kernel changes in a second instance: `npm run dev:isolated` runs Paper with its own state dir
   (`~/.paper-dev`), Chromium profile, Vite port (5183) and MCP port (47820), so the two never collide. Point a
   client at it with `http://127.0.0.1:47820/mcp`.
 - If the MCP port is taken, the kernel walks up to nine ports and writes the one it got into `~/.paper/mcp.json`.
@@ -119,7 +169,7 @@ Two cautions:
 
 <!-- tools:begin (generated by `npm run tools:sync`; do not edit by hand) -->
 
-31 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
+32 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
 
 ### Instance
 
@@ -154,7 +204,13 @@ The PTY sessions Paper runs: agents and shells.
 
 #### `sessions_list` · read-only
 
-Every live session (agent or shell) with id, provider, account, cwd, status (starting/working/idle/exited/handoff), title and usage totals. Session ids are what every other session_* tool takes.
+Every live session (agent or shell) with id, provider, account, cwd, status (starting/working/idle/exited/handoff), title and usage totals. `restoredAt` is set on sessions brought back after Paper restarted. Session ids are what every other session_* tool takes.
+
+_No parameters._
+
+#### `sessions_persisted` · read-only
+
+The on-disk session registry (~/.paper/sessions.json) that brings sessions back after Paper restarts: one record per session with its full meta, wasWorking (mid-turn at the last write), lastActiveAt and terminal size, plus quitAt when the last run quit cleanly. `restore` is what this boot did with each record (resumed/fresh/reattached/shell/exited/failed, whether a continuation nudge was sent) and any orphaned CLI processes it terminated. Holds no secrets.
 
 _No parameters._
 
@@ -387,7 +443,7 @@ What survives a restart.
 
 #### `state_get` · read-only
 
-What Paper has saved to ~/.paper/state.json: saved tabs and pane layouts, defaults (provider, cwd, default account per provider), widget prefs and recent directories. Accounts are listed via accounts_list.
+What Paper has saved to ~/.paper/state.json: saved tabs and pane layouts, defaults (provider, cwd, default account per provider, resumeNudge), widget prefs and recent directories. Accounts are listed via accounts_list.
 
 | param | type | | description |
 |---|---|---|---|
@@ -395,13 +451,14 @@ What Paper has saved to ~/.paper/state.json: saved tabs and pane layouts, defaul
 
 #### `state_set_defaults`
 
-Change the default provider, working directory, or pinned account per provider for new sessions.
+Change the default provider, working directory, or pinned account per provider for new sessions, and whether agents that were mid-turn when Paper died get a continuation prompt after the restart (resume_nudge).
 
 | param | type | | description |
 |---|---|---|---|
 | `provider` | "claude" \| "codex" \| "shell" | optional |  |
 | `cwd` | string | optional | Absolute directory |
 | `account_by_provider` | object | optional | e.g. {"claude": "<account id>"} |
+| `resume_nudge` | boolean | optional | After a restart, tell agents that were working to continue where they left off (default true) |
 
 #### `accounts_list` · read-only
 
