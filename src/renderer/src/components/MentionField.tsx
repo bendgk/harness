@@ -82,7 +82,7 @@ export default function MentionField({
     const list = matchKey.split(' ')
     setMention({
       owner, query: token.query, matches: list, agents: targets.agents,
-      index: Math.max(0, keep ? list.indexOf(keep) : 0), passive: false
+      index: Math.max(0, keep ? list.indexOf(keep) : 0)
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, matchKey, token?.query])

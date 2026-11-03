@@ -97,7 +97,12 @@ export const claudeProvider: Provider = {
     return {
       file: this.bin,
       args,
-      env: { CLAUDE_CONFIG_DIR: home },
+      // Claude only uses synchronized output (DEC 2026) once the terminal has
+      // answered XTVERSION, which xterm.js never does. Forced on, every frame
+      // comes wrapped in BSU/ESU and the pane writes it to xterm whole
+      // (renderer lib/sync-output.ts), so a redraw that spans several pty
+      // reads never renders half done. Ignored by Claude inside tmux.
+      env: { CLAUDE_CONFIG_DIR: home, CLAUDE_CODE_FORCE_SYNC_OUTPUT: '1' },
       nativeSessionId: id,
       transcriptPath: join(projectDir(home, cwd), `${id}.jsonl`)
     }

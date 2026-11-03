@@ -11,7 +11,8 @@ import MentionMenu, { menuHeight } from './MentionMenu'
 import { MentionHighlighter, MentionTracker, locateToken, type MentionKind } from '../lib/term-mentions'
 import { completionKeys } from '../lib/machines'
 import { agentSummaries, knownAgentNames, mentionTargets } from '../lib/agents'
-import { SmoothScroll, TUNING, type ScrollTraceRecord } from '../lib/smooth-scroll'
+import { SmoothScroll, TUNING, type ProbeFrame, type ScrollTraceRecord } from '../lib/smooth-scroll'
+import { SyncOutput } from '../lib/sync-output'
 import type { ProviderId } from '@shared/types'
 
 const api = window.paper
@@ -51,6 +52,8 @@ interface DevScroll {
   tuning: typeof TUNING
   trace: { on: boolean; max: number; records: (ScrollTraceRecord & { session: string })[] }
   push: (session: string, r: ScrollTraceRecord) => void
+  /** Set by tests: sees every frame an activation puts on screen (see smooth-scroll's ProbeFrame). */
+  probe?: (session: string, f: ProbeFrame) => void
 }
 function devScroll(): DevScroll | null {
   if (!import.meta.env.DEV) return null
@@ -73,6 +76,29 @@ function devScroll(): DevScroll | null {
   return w.__paperScroll
 }
 
+/**
+ * Dev-only record of what a pane wrote to its pty, to prove what reached the
+ * program: `__paperPty.on = true`, act, then read `__paperPty.writes`.
+ */
+function devPty(session: string, data: string): void {
+  const w = window as unknown as { __paperPty?: { on: boolean; writes: { session: string; t: number; data: string }[] } }
+  if (!w.__paperPty) w.__paperPty = { on: false, writes: [] }
+  if (w.__paperPty.on) w.__paperPty.writes.push({ session, t: Math.round(performance.now()), data })
+}
+
+/**
+ * What xterm sends on its own rather than because of a key: mouse reports
+ * (SGR, URXVT, X10/normal), focus in/out, and its answers to the program's
+ * queries (cursor position, DA, DECRPM, window reports, OSC and DCS replies).
+ * These must not end a glide that rests off the row grid — a mouse-tracking
+ * app gets a report for every move, and Claude Code queries the terminal.
+ */
+const REPORT = new RegExp('^(?:' + [
+  '\\x1b\\[<[\\d;]+[Mm]', '\\x1b\\[M[\\s\\S]{3}', '\\x1b\\[\\d+;\\d+;\\d+M', '\\x1b\\[[IO]',
+  '\\x1b\\[\\d+;\\d+R', '\\x1b\\[[?>=]?[\\d;]*c', '\\x1b\\[\\??[\\d;]+\\$y', '\\x1b\\[[\\d;]+t',
+  '\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)', '\\x1bP[\\s\\S]*?\\x1b\\\\'
+].join('|') + ')+$')
+
 /** Where the dropdown sits, in pane-body pixels. */
 interface Anchor { left: number; top?: number; bottom?: number; placement: 'above' | 'below' }
 
@@ -82,6 +108,7 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
   const fitRef = useRef<FitAddon | null>(null)
   const searchRef = useRef<SearchAddon | null>(null)
   const highlightRef = useRef<MentionHighlighter | null>(null)
+  const scrollerRef = useRef<SmoothScroll | null>(null)
   const theme = useStore((s) => s.theme)
   const fontSize = useStore((s) => s.fontSize)
   const machines = useStore((s) => s.machines)
@@ -158,15 +185,26 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     }
     sendResize()
 
+    // Everything this pane writes to the pty (keys, completions, wheel reports)
+    // goes through here; dev builds can record it (`__paperPty`, see CLAUDE.md).
+    const send = (d: string): void => {
+      if (import.meta.env.DEV) devPty(sessionId, d)
+      void api.session.write(sessionId, d)
+    }
+
     // ---- smooth scrolling (lib/smooth-scroll.ts) ------------------------------
     const scroller = new SmoothScroll(term, {
-      write: (d) => void api.session.write(sessionId, d),
+      write: (d) => send(d),
       sensitivity: () => useStore.getState().widgets.scrollSensitivity ?? 1,
       notchRows: () => useStore.getState().widgets.scrollNotchRows ?? 3,
       // Claude Code drops the first wheel report after a direction change.
       dropsFlipReport: () => provider === 'claude',
-      trace: import.meta.env.DEV ? (r) => devScroll()?.push(sessionId, r) : undefined
+      // Content resting off the row grid moves the alternate-screen mention tags with it.
+      onLayout: () => highlightRef.current?.relayout(),
+      trace: import.meta.env.DEV ? (r) => devScroll()?.push(sessionId, r) : undefined,
+      probe: import.meta.env.DEV ? (f) => devScroll()?.probe?.(sessionId, f) : undefined
     })
+    scrollerRef.current = scroller
     if (import.meta.env.DEV) devScroll()?.panes.set(sessionId, { term, scroller })
 
     // ---- @-mention autocomplete -------------------------------------------
@@ -193,9 +231,9 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       // Opening the menu is when "what is everyone doing" is worth re-reading.
       if (!prev) void store().refreshAgents()
       const index = prev && prev.matches[prev.index] ? Math.max(0, matches.indexOf(prev.matches[prev.index])) : 0
-      // A bare "@" only advertises: in Claude Code it is also the file picker,
-      // so keys are not taken until the user has typed toward an agent or machine.
-      store().setMention({ owner, query: q!, matches, agents, index, passive: q === '' })
+      // From the bare "@" on, the menu takes ↑ ↓ Tab ↩ Esc (Claude Code's own
+      // @file picker below it gets them back once nothing matches).
+      store().setMention({ owner, query: q!, matches, agents, index })
       placeRef.current()
     }
     const close = (boundary: boolean): void => {
@@ -206,7 +244,7 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       const q = tracker.query ?? ''
       // Written straight to the pty, not through term.input, so the tracker
       // does not see its own completion as typing.
-      void api.session.write(sessionId, completionKeys(q, alias))
+      send(completionKeys(q, alias))
       close(true)
     }
     acceptRef.current = accept
@@ -214,24 +252,26 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     const disposeData = term.onData((d) => {
       // Wheel reports the scroller is batching into one write.
       if (scroller.capture(d)) return
-      void api.session.write(sessionId, d)
+      // Typing (anything that reaches the program) shows the real frame at once;
+      // clicks, modifier keys and app shortcuts leave a resting glide alone.
+      if (!REPORT.test(d)) scroller.cancel('input')
+      send(d)
       tracker.feed(d)
       if (tracker.query !== null || mine()) refresh()
     })
-    const disposeBinary = term.onBinary((d) => { if (!scroller.capture(d)) void api.session.write(sessionId, d) })
+    // (onBinary is only X10 mouse reports: never typing.)
+    const disposeBinary = term.onBinary((d) => { if (!scroller.capture(d)) send(d) })
 
     // keydown is acted on; its keypress/keyup twins are swallowed too, or
     // Enter's keypress would still reach the program as a carriage return.
     let swallow: string | null = null
     term.attachCustomKeyEventHandler((ev) => {
-      // Typing shows the real frame at once.
-      if (ev.type === 'keydown') scroller.cancel('key')
       if (swallow && ev.key === swallow && ev.type !== 'keydown') {
         if (ev.type === 'keyup') swallow = null
         return false
       }
       const m = mine()
-      if (!m || m.passive || ev.type !== 'keydown' || ev.metaKey || ev.ctrlKey || ev.altKey) return true
+      if (!m || !m.matches.length || ev.type !== 'keydown' || ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return true
       const take = (): false => { ev.preventDefault(); ev.stopPropagation(); swallow = ev.key; return false }
       switch (ev.key) {
         case 'ArrowDown':
@@ -256,7 +296,8 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     })
 
     // A click can move the cursor anywhere, and leaving the pane abandons the token.
-    const onMouse = (): void => { scroller.cancel('mouse'); close(false) }
+    // (It does not end a resting glide: the scroller corrects where it lands.)
+    const onMouse = (): void => close(false)
     host.addEventListener('mousedown', onMouse)
     const textarea = term.textarea
     const onBlur = (): void => close(false)
@@ -272,6 +313,7 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       (kind) => MENTION_COLORS[themeRef.current][kind],
       (kind, target) => { if (kind === 'agent') void store().goToAgent(target); else store().openMachines({ focus: target }) }
     )
+    highlighter.setShift(() => scroller.restShift())
     highlighter.setTargets(store().machines.map((m) => m.alias), knownAgentNames(store()))
     highlightRef.current = highlighter
 
@@ -311,8 +353,10 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       sendResize()
     })
 
+    // Frames a program wraps in DEC 2026 reach xterm whole (lib/sync-output.ts).
+    const sync = new SyncOutput((d) => term.write(d))
     const off = api.onPtyData((p) => {
-      if (p.sessionId === sessionId) term.write(p.data)
+      if (p.sessionId === sessionId) sync.feed(p.data)
     })
 
     const ro = new ResizeObserver(() => sendResize())
@@ -328,6 +372,7 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       disposed = true
       register?.(null)
       off()
+      sync.dispose()
       ro.disconnect()
       disposeData.dispose()
       disposeBinary.dispose()
@@ -337,6 +382,7 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       textarea?.removeEventListener('blur', onBlur)
       textarea?.removeEventListener('paste', onPaste)
       scroller.dispose()
+      scrollerRef.current = null
       if (import.meta.env.DEV && devScroll()?.panes.get(sessionId)?.scroller === scroller) devScroll()?.panes.delete(sessionId)
       highlighter.dispose()
       highlightRef.current = null
@@ -351,6 +397,8 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
   useEffect(() => {
     const term = termRef.current
     if (!term) return
+    // The band of a glide is pixels in the old colours: show the real frame.
+    scrollerRef.current?.cancel('theme')
     term.options.theme = termTheme(theme)
     highlightRef.current?.repaint()
   }, [theme])
@@ -418,10 +466,9 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
           agents={shownAgents}
           machines={shownMachines}
           index={mention.index}
-          passive={mention.passive}
           placement={anchor.placement}
           style={{ left: anchor.left, top: anchor.top, bottom: anchor.bottom }}
-          onHover={(i) => { if (!mention.passive) useStore.getState().setMention({ ...mention, index: i }) }}
+          onHover={(i) => useStore.getState().setMention({ ...mention, index: i })}
           onPick={(alias) => acceptRef.current(alias)}
         />
       )}
