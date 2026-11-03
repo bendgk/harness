@@ -55,7 +55,8 @@ const TAG_KEYS = ['id', 'provider', 'native', 'cwd', 'title'] as const
 
 /** Tag values are one line; tmux would keep a newline, the inventory parser would not. */
 function tagValue(v: string): string {
-  return v.replace(/[\r\n\t]+/g, ' ').slice(0, 400)
+  // One argv word to tmux; a trailing ';' (or '\\') would be read as a command separator.
+  return v.replace(/[\r\n\t]+/g, ' ').slice(0, 400).replace(/[;\\]+$/, '')
 }
 
 function tagCommands(name: string, tags: RemoteTags): string[] {

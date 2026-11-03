@@ -180,6 +180,10 @@ export class SessionManager extends EventEmitter {
   adopt(): void {
     liveRef().current = this
     for (const s of this.sessions.values()) {
+      // Sessions started by a generation that predates machines have no host;
+      // they are, by definition, local. Backfill so nothing downstream guesses.
+      if (!s.meta.host) s.meta.host = LOCAL_HOST
+      if (!s.meta.lineage) s.meta.lineage = []
       for (const d of s.subs ?? []) { try { d.dispose() } catch { /* already gone */ } }
       s.subs = []
       if (s.proc) this.attach(s, s.proc)
