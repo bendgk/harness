@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
-  Account, AgentProviderId, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, MachineProbe, SessionMeta,
+  Account, AgentProviderId, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, MachineInventory, MachineProbe, SessionMeta,
   SpawnRequest, Tab, ToolManifestEntry, ToolResult, UsageSnapshot, WidgetPrefs
 } from '@shared/types'
 
@@ -81,7 +81,11 @@ const api = {
     update: (alias: string, patch: { label?: string; note?: string; defaultCwd?: string }) =>
       invoke<Machine>('machines:update', alias, patch),
     remove: (alias: string) => invoke<void>('machines:remove', alias),
-    probe: (alias: string) => invoke<MachineProbe>('machines:probe', alias)
+    probe: (alias: string) => invoke<MachineProbe>('machines:probe', alias),
+    /** What is really running on each machine (polled; `refresh` forces a fresh read). */
+    inventory: (refresh?: boolean) => invoke<MachineInventory[]>('machines:inventory', refresh ?? false),
+    /** Bring an agent found on a machine (not attached here) into Paper as a session. */
+    adopt: (alias: string, tmux: string) => invoke<SessionMeta>('machines:adopt', alias, tmux)
   },
 
   /** The same tool registry the MCP server exposes, callable from the UI. */
@@ -98,6 +102,7 @@ const api = {
   onHandoff: (fn: (p: { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }) => void) =>
     on('handoff:progress', fn),
   onMachines: (fn: (m: Machine[]) => void) => on('machines:update', fn),
+  onInventory: (fn: (inv: MachineInventory) => void) => on('machines:inventory', fn),
   onCommand: (fn: (p: { command: string }) => void) => on('app:command', fn),
   onHot: (fn: (p: { generation: number; at: number; tools: number }) => void) => on('hot:update', fn)
 }

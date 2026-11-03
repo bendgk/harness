@@ -5,9 +5,9 @@
  * bodies are implemented by the machines work stream.
  */
 import { EventEmitter } from 'node:events'
-import type { AgentProviderId, Machine, MachineProbe } from '@shared/types'
+import type { AgentProviderId, Machine, MachineInventory, MachineProbe } from '@shared/types'
 
-/** Emits 'update' with the full Machine[] whenever the registry or a probe changes. */
+/** Emits 'update' (Machine[]) on registry/probe changes and 'inventory' (MachineInventory) on each poll result. */
 export const machineEvents = new EventEmitter()
 
 export function listMachines(): Machine[] {
@@ -68,5 +68,21 @@ export async function suggestMachines(): Promise<{ alias: string; hostname?: str
  * `sessionId` is the Paper session the prompt is for.
  */
 export function machineContextPrompt(_opts: { sessionId: string; host: string }): string {
+  throw new Error('not implemented')
+}
+
+/**
+ * Ground truth of agents on each registered machine: `tmux -L paper list-sessions`
+ * with the @paper_* user options (see HostedAgent). Polled in the background
+ * (~10s while the window is focused, slower otherwise, immediately on boot and
+ * after any remote launch/close/handoff); `refresh` forces a fresh read.
+ * `attached` is filled from the live session list.
+ */
+export async function inventory(_opts?: { refresh?: boolean; alias?: string }): Promise<MachineInventory[]> {
+  throw new Error('not implemented')
+}
+
+/** Start/stop the background inventory poller (called from wireEvents; stop on dispose). */
+export function startInventory(): () => void {
   throw new Error('not implemented')
 }

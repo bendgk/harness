@@ -238,6 +238,40 @@ export interface SpawnRequest {
   host?: string
 }
 
+/**
+ * An agent's tmux session on a machine, as the machine itself reports it.
+ * Remote launches tag their tmux session with user options so this can be
+ * read back without trusting Paper's own memory:
+ *   @paper_id (Paper session id), @paper_provider, @paper_native (conversation id),
+ *   @paper_cwd, @paper_title (best-effort, may lag)
+ * on the private socket `tmux -L paper`, session names `paper-<12 hex>`.
+ */
+export interface HostedAgent {
+  tmux: string
+  /** Paper session id from @paper_id; may not be live in this Paper (adoptable). */
+  sessionId?: string
+  provider?: ProviderId
+  nativeSessionId?: string
+  cwd?: string
+  title?: string
+  createdAt?: number
+  /** Last time the tmux session saw output (epoch ms). */
+  activityAt?: number
+  /** Foreground command in the pane, e.g. "claude". */
+  command?: string
+  /** Whether a local Paper session is currently attached to it. */
+  attached: boolean
+}
+
+/** Ground truth for one machine: what is actually running there right now. */
+export interface MachineInventory {
+  alias: string
+  at: number
+  ok: boolean
+  error?: MachineError
+  agents: HostedAgent[]
+}
+
 /** Moving a session to another computer (or back to this one). */
 export interface MachineHandoffRequest {
   sessionId: string
@@ -277,6 +311,7 @@ export interface MainEvents {
   'handoff:progress': { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }
   'app:command': { command: string }
   'machines:update': Machine[]
+  'machines:inventory': MachineInventory
   /** A new main-process app bundle was activated (hot reload). */
   'hot:update': { generation: number; at: number; tools: number }
 }
