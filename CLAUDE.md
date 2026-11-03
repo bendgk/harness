@@ -50,9 +50,10 @@ src/main/menu.ts         Application menu = the single source of shortcuts; send
 src/main/mcp.ts          MCP server (Streamable HTTP, stateless) over the tool registry.
 src/main/tools/          THE TOOL REGISTRY. types.ts (contract), app/sessions/ui/dev/state.ts (tools),
                          index.ts (list), runtime.ts (validate+invoke), context.ts (binds live services).
-src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage,handoff,tools,on*}.
+src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage,handoff,machines,tools,on*}.
 src/renderer/src/        React + zustand UI. state/store.ts is the app store (HMR-safe, exposed as
-                         window.__paper); state/tree.ts is the pane-tree algebra; components/*, widgets/*.
+                         window.__paper); state/tree.ts is the pane-tree algebra; components/*, widgets/*;
+                         lib/machines.ts, lib/term-mentions.ts, lib/dev-fakes.ts (see *Machines in the UI*).
 src/shared/              Types and pricing used by both sides.
 scripts/sync-tools.mjs   Regenerates the Tools section of this file from the registry.
 ```
@@ -285,7 +286,7 @@ Recent console output from the renderer (errors, warnings, React messages). Newe
 
 #### `ui_command`
 
-Dispatch one of the application-menu commands exactly as its shortcut would (⌘K = palette.open, ⌘D = pane.split.row...). Known: session.new, session.new.claude, session.new.codex, session.new.shell, session.newInFolder, session.cd, session.close, session.restart, session.rename, session.interrupt, session.steer, session.find, session.clear, account.switch, accounts.open, palette.open, pane.split.row, pane.split.col, pane.close, pane.contents, pane.next, pane.prev, tab.next, tab.prev, tab.select.0, sidebar.toggle, widgets.toggle, zen.toggle, font.bigger, font.smaller (tab.select.N for N in 0..8).
+Dispatch one of the application-menu commands exactly as its shortcut would (⌘K = palette.open, ⌘D = pane.split.row...). Known: session.new, session.new.claude, session.new.codex, session.new.shell, session.newInFolder, session.cd, session.close, session.restart, session.rename, session.interrupt, session.steer, session.find, session.clear, session.moveMachine, account.switch, accounts.open, machines.open, palette.open, pane.split.row, pane.split.col, pane.close, pane.contents, pane.next, pane.prev, tab.next, tab.prev, tab.select.0, sidebar.toggle, widgets.toggle, zen.toggle, font.bigger, font.smaller (tab.select.N for N in 0..8).
 
 | param | type | | description |
 |---|---|---|---|
@@ -436,6 +437,66 @@ _No parameters._
 - New persisted field → `Persisted` in `store.ts`, `AppSnapshot` in `shared/types.ts`, `state_get` shows it.
 - Update this file, run `npm run check`.
 
+## Machines in the UI
+
+Remote computers are registered by **ssh host alias** (`Machine`, `src/shared/types.ts`). Agents run on this Mac by
+default; a session can instead run *on* a machine (`SessionMeta.host` = alias, kept alive in tmux there), and can
+be moved between machines with its conversation intact. The renderer side:
+
+| Piece | File | What it does |
+|---|---|---|
+| Store slice | `state/store.ts` | `machines`, `probing`, `inventory`, `inventoryLoading`, `machinesPanel`, `paneHost`, `mention`, `lastActivity`, `treeCollapsed`, `gateway`, `devFakes` — all in `ui_state`. Actions: `addMachine`/`updateMachine`/`removeMachine`/`probeMachine`, `openMachines({focus, adding})`, `moveToMachine`, `refreshInventory(force)`, `adoptAgent`, `revealSession`, `refreshGateway`. |
+| Helpers | `lib/machines.ts` | alias validation (`ALIAS_RE`, never `local`), health (`ok`/`degraded`/`error`/`unknown`), `canLaunch`, mention ranking (alias prefix → alias substring → label/hostname for ≥2 chars), `mentionRegex`, `completionKeys`, `cleanIpcError`, `splitHint`. |
+| Machines panel | `components/MachinesPanel.tsx` | ⌘⇧M (`machines.open`). Status dot, blue `@alias`, label, `user@host`, OS, tool versions ✓/✗, latency, "tested …", reverse-tunnel state (from the `gateway_status` tool via `tools.invoke`), the "agents may move themselves to this Mac" toggle (`allowAgentHandoffToLocal`), test / edit / inline remove confirm (never `window.confirm`). Errors show `message`, the `hint` prominently, and `detail` behind a disclosure. Add: free alias with validation + `machines.suggest()` chips. |
+| Agents tree | `components/MachineTree.tsx` | Top of the sidebar: This Mac + each machine (status dot, active count, "checked 4s ago", inline error with hint) and the agents under each. Remote rows merge live store sessions (`host === alias`) with the machine's `inventory` (the truth: tmux sessions found there); one running there but not attached here shows **detached**. Click: switch to its tab → else open a new tab attached → else `machines.adopt` and open a new tab. Always a tab, never a split. Refreshes `inventory(true)` on mount and on window focus; folds persist in localStorage `paper:tree-collapsed`; ↑↓←→ walk/fold. |
+| Where it runs | `components/HostPicker.tsx` (in `EmptyPane`) | "on This Mac / @alias" chips; machines whose probe failed (or that lack tmux) are disabled with the reason as tooltip. Choice lives in `paneHost[paneId]`; a split inherits its pane's host. Remote spawns pass `host` and `cwd = machine.defaultCwd` (else none — main picks). |
+| Move sheet | `components/MoveMachine.tsx` | ⌘⇧P (`session.moveMachine`): This Mac + machines, target directory (placeholder states the default chain: machine default → same path → `~`-relative), optional "continue with" (mention-aware), calls `handoff.toMachine`. |
+| Badges | `components/HostTag.tsx` | `AliasChip` (the one blue tag style), `HostTag` in pane headers (pulse while connecting/reconnecting, red when lost, tooltip explains), `@alias` in tabs and the status bar, `RestoredHint` for `restoredAt`. |
+| Handoff overlay | `Sheets.tsx` `HandoffOverlay` | Machine-handoff failures stay up as a card (message, **hint**, "session unchanged", dismiss) instead of a 3 s toast. A handoff this window did not start (`handoff.initiator === 'agent'`, i.e. the agent called `session_handoff`) reads "‹title› is moving itself to @g6e · ‹stage›"; the target is inferred from `@alias` / "this Mac" in the stage text. |
+| Palette | `CommandPalette.tsx` | Manage/Add machine, Move to machine…, Move back to this Mac, and per machine "New Claude / New Codex / New terminal on @alias", "Move session to @alias" (a machine that cannot take it opens its details instead). |
+
+### @-mention autocomplete (terminal and Paper's inputs)
+
+- **Terminal** (`TerminalPane.tsx` + `lib/term-mentions.ts`). `MentionTracker` watches the keystrokes xterm is about
+  to send (`onData`): `@` opens a token only at start of input or after whitespace; `[A-Za-z0-9._-]` extends it;
+  Backspace shrinks (deleting the `@` ends it); space, Enter, control chars, escape sequences (arrows), pastes, a
+  mouse click and blur end it. While the token matches ≥1 machine, `mention` is set in the store and the dropdown
+  renders. A bare `@` is **passive** (shown, but takes no keys — in Claude Code `@` is also the file picker).
+  Once a character is typed, `attachCustomKeyEventHandler` claims ↑ ↓ Tab ↩ Esc (preventDefault + return false,
+  and the keypress/keyup twins are swallowed too, or Enter's keypress would still send `\r`); every other key
+  passes through untouched. Accepting writes the rest of the alias plus a space straight to the pty
+  (`completionKeys`: just the tail for a prefix match, otherwise backspaces and the full alias), so the CLI's own
+  picker sees `@g6e ` and closes. In a plain shell's alternate screen (vim, less) it stays off.
+- **Anchoring.** Agent TUIs park the real cursor away from their input box, so `locateToken` finds the typed
+  `@query` in the viewport (nearest the cursor) and falls back to the cursor. Cell size = `.xterm-screen` rect /
+  cols×rows. The menu is a DOM sibling of `.term-host` in `.pane-body`, placed **above** the token's line (Claude
+  draws its picker below) and flipped below near the top; re-placed on `onWriteParsed` via rAF. It is not
+  focusable and prevents mousedown, so xterm keeps focus.
+- **Blue tags.** `MentionHighlighter` paints registered `@alias`es (word boundary: not after a word char, so
+  `ben@g6e` is left alone; a trailing `.` is punctuation) with xterm decorations (`registerMarker` +
+  `registerDecoration`, opaque `#RRGGBB` per theme) over the **viewport only**, rescanning at most every 60 ms after
+  writes/scroll/resize, keeping unchanged decorations so redraws do not flicker. Decorations exist only on the
+  normal buffer; a link provider (all buffers) makes the tags clickable → Machines panel focused on that alias.
+- **Paper's inputs** (`components/MentionField.tsx`): steer (⌘↩) and "continue with". A transparent-ink
+  textarea/input over a mirror that paints the text with `.mention-hl` tags (box-shadow, never padding, so glyphs
+  stay aligned); same dropdown, portalled to `body`. `Modal` ignores Esc while the target is inside
+  `[data-mention-open="true"]`, so Esc closes the menu, not the sheet.
+
+### Dev fakes (renderer-only stand-in for main's machine handlers)
+
+`lib/dev-fakes.ts` serves an in-memory registry (`g6e` ok, `a100` missing tmux, `lab` auth error), suggestions,
+probes, inventory with two detached agents, adopt, `handoff.toMachine` with staged progress, a fake gateway status,
+and "remote" sessions that are really local shells with `host`/`remote` decorated in the renderer. It is inert
+unless `import.meta.env.DEV` **and** `localStorage['paper:fake-machines'] === '1'`:
+
+```
+ui_eval { code: "localStorage.setItem('paper:fake-machines','1'); location.reload()" }   # on
+ui_eval { code: "localStorage.removeItem('paper:fake-machines'); location.reload()" }    # off
+```
+
+With it on, `window.__paperFakes` also has `setLink(sessionId, 'lost')` and `selfHandoff(sessionId, host)` (an
+agent-initiated move) for exercising those states. `ui_state.devFakes` says whether it is active.
+
 ## Verifying a change — recipes
 
 Renderer edit:
@@ -506,5 +567,9 @@ ui_eval { code: "window.__paper.store.getState().tabs.length" }
   their initial focus from `autoFocus` on the input (or from `Modal`, once, on open); `Modal` keeps `onClose` in a
   ref precisely so a per-render callback cannot re-trigger anything. Test keyboard flows with `ui_type` and check
   `document.activeElement` afterwards — an input that loses the caret on the second character is this bug.
+- `ui_type { key }` takes **Electron** key names: `Down`, `Up`, `Left`, `Right`, `Tab`, `Enter`, `Escape`,
+  `Backspace`. `ArrowDown` arrives in the page as `key: ''` and silently does nothing.
+- An app-level `keydown` listener in the capture phase on `window` (like `Modal`'s Esc) runs before any field's
+  own handler. A field that wants a key first must be excluded by the listener (see `data-mention-open`).
 - `ui_eval` decides expression vs statement form by parsing in main; if your snippet uses `return`, it is run as a
   statement body. A thrown error in the page comes back as the tool error with the last renderer console lines.

@@ -22,7 +22,11 @@ export default function Modal({ title, subtitle, onClose, children, wide }: Prop
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') { e.stopPropagation(); onCloseRef.current() }
+      if (e.key !== 'Escape') return
+      // An open @-mention menu inside the sheet takes Esc for itself first.
+      if ((e.target as HTMLElement | null)?.closest?.('[data-mention-open="true"]')) return
+      e.stopPropagation()
+      onCloseRef.current()
     }
     window.addEventListener('keydown', onKey, true)
     // Make the sheet keyboard-usable immediately — unless a control inside it

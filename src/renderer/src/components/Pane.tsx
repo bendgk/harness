@@ -5,6 +5,10 @@ import { PANE_WIDGETS, paneWidget } from '../widgets/panes'
 import { CloseIcon, ContentsIcon, FolderIcon, SplitDownIcon, SplitRightIcon } from './Icons'
 import type { DropZone, PaneContent, ProviderId, SessionMeta } from '@shared/types'
 import { leaves } from '../state/tree'
+import { LOCAL_HOST } from '@shared/types'
+import HostTag, { AliasChip, RestoredHint } from './HostTag'
+import HostPicker from './HostPicker'
+import { canLaunch } from '../lib/machines'
 
 const PROVIDER_NAME: Record<ProviderId, string> = {
   claude: 'Claude Code',
@@ -41,13 +45,22 @@ function EmptyPane({ paneId }: { paneId: string }): JSX.Element {
     return tab ? leaves(tab.root).find((l) => l.id === paneId) : undefined
   })
   const [showWidgets, setShowWidgets] = useState(false)
+  const host = useStore((s) => s.paneHost[paneId] ?? LOCAL_HOST)
+  const setPaneHost = useStore((s) => s.setPaneHost)
+  const machine = useStore((s) => s.machines.find((m) => m.alias === host))
+  const openMachines = useStore((s) => s.openMachines)
+  const remote = host !== LOCAL_HOST
+  const hasMachines = useStore((s) => s.machines.length > 0)
 
   const cwd = (paneNode?.content.type === 'terminal' ? paneNode.content.cwd : undefined) ?? defaults.cwd
 
   const start = (provider: ProviderId): void => {
     focusPane(paneId)
-    void spawn({ provider })
+    void spawn({ provider, host })
   }
+  // On a machine, a harness that is not installed there is disabled, with why.
+  const gate = (provider: ProviderId): { ok: boolean; reason?: string } =>
+    remote ? canLaunch(machine, provider) : { ok: true }
 
   return (
     <div className="empty-pane">
@@ -57,43 +70,71 @@ function EmptyPane({ paneId }: { paneId: string }): JSX.Element {
           <button
             className="ghost-btn"
             onClick={() => start('claude')}
-            title="Run Claude Code in this pane"
+            disabled={!gate('claude').ok}
+            title={gate('claude').reason ?? (remote ? `Run Claude Code in this pane, on @${host}` : 'Run Claude Code in this pane')}
           >
             <span className="prov-dot prov-claude" /> Claude Code
           </button>
           <button
             className="ghost-btn"
             onClick={() => start('codex')}
-            title="Run Codex in this pane"
+            disabled={!gate('codex').ok}
+            title={gate('codex').reason ?? (remote ? `Run Codex in this pane, on @${host}` : 'Run Codex in this pane')}
           >
             <span className="prov-dot prov-codex" /> Codex
           </button>
           <button
             className="ghost-btn"
             onClick={() => start('shell')}
-            title="Open a plain login shell in this pane"
+            disabled={!gate('shell').ok}
+            title={gate('shell').reason ?? (remote ? `Open a plain login shell in this pane, on @${host}` : 'Open a plain login shell in this pane')}
           >
             <span className="prov-dot prov-shell" /> Terminal
           </button>
         </div>
 
-        {/* Where it will start, and one click to change that. */}
-        <button
-          className="empty-dir"
-          title="Choose the working directory (⌘L)"
-          onClick={() => { focusPane(paneId); setOverlay('cwd') }}
-        >
-          <FolderIcon />
-          <span className="mono">{shortPath(cwd)}</span>
-        </button>
+        {/* Which computer, and where on it — one click to change either. */}
+        {hasMachines && <HostPicker value={host} onChange={(h) => { focusPane(paneId); setPaneHost(paneId, h) }} />}
 
-        <button
-          className="empty-widget-toggle"
-          onClick={() => setShowWidgets((v) => !v)}
-          title="Put something other than a terminal in this pane"
-        >
-          {showWidgets ? 'hide widgets' : 'or place a widget'}
-        </button>
+        {remote ? (
+          <button
+            className="empty-dir"
+            title={`Directory on @${host} — set its default in Machines (⌘⇧M)`}
+            onClick={() => openMachines({ focus: host })}
+          >
+            <FolderIcon />
+            <AliasChip alias={host} />
+            <span className="mono">{machine?.defaultCwd ?? '~'}</span>
+          </button>
+        ) : (
+          <button
+            className="empty-dir"
+            title="Choose the working directory (⌘L)"
+            onClick={() => { focusPane(paneId); setOverlay('cwd') }}
+          >
+            <FolderIcon />
+            <span className="mono">{shortPath(cwd)}</span>
+          </button>
+        )}
+
+        <div className="empty-links">
+          <button
+            className="empty-widget-toggle"
+            onClick={() => setShowWidgets((v) => !v)}
+            title="Put something other than a terminal in this pane"
+          >
+            {showWidgets ? 'hide widgets' : 'or place a widget'}
+          </button>
+          {!hasMachines && (
+            <button
+              className="empty-widget-toggle"
+              title="Register an ssh host so agents can run there (⌘⇧M)"
+              onClick={() => openMachines({ adding: true })}
+            >
+              or run on another computer
+            </button>
+          )}
+        </div>
 
         {showWidgets && (
           <div className="widget-grid fade-in">
@@ -163,6 +204,7 @@ export default function Pane({ paneId, content, focused }: Props): JSX.Element {
   const dropPane = useStore((s) => s.dropPane)
   const setWidgetProps = useStore((s) => s.setWidgetProps)
   const agentStatus = useStore((s) => s.activeSession()?.status ?? 'none')
+  const openMachines = useStore((s) => s.openMachines)
 
   const handle = useRef<TerminalHandle | null>(null)
   const register = useCallback((h: TerminalHandle | null) => { handle.current = h }, [])
@@ -207,6 +249,8 @@ export default function Pane({ paneId, content, focused }: Props): JSX.Element {
             <span className={`prov-tag prov-${meta.provider}`} title={PROVIDER_NAME[meta.provider]}>
               {PROVIDER_TAG[meta.provider]}
             </span>
+            <HostTag meta={meta} onClick={() => openMachines({ focus: meta.host })} />
+            <RestoredHint meta={meta} />
             {meta.provider !== 'shell' && (
               <button
                 className="acct-chip"
@@ -261,7 +305,7 @@ export default function Pane({ paneId, content, focused }: Props): JSX.Element {
       <div className="pane-body">
         {content.type === 'terminal'
           ? sessionId
-            ? <TerminalPane sessionId={sessionId} focused={focused} register={register} />
+            ? <TerminalPane sessionId={sessionId} focused={focused} provider={meta?.provider} register={register} />
             : <EmptyPane paneId={paneId} />
           : widget
             ? <widget.component

@@ -4,7 +4,9 @@ import { Meter, Spark, toneFor } from '../widgets/Meter'
 import Pet from '../widgets/Pet'
 import { elapsed, pct, tokens, until, usd, windowLabel } from '../lib/format'
 import { shortPath } from './Pane'
-import type { ProviderId } from '@shared/types'
+import { LOCAL_HOST, type ProviderId } from '@shared/types'
+import MachineTree from './MachineTree'
+import { AliasChip } from './HostTag'
 
 const PROVIDER_NAME: Record<ProviderId, string> = {
   claude: 'Claude Code',
@@ -40,6 +42,7 @@ export default function Sidebar(): JSX.Element {
   const account = useStore((s) => s.accounts.find((a) => a.id === session?.accountId))
   const widgets = useStore((s) => s.widgets)
   const setOverlay = useStore((s) => s.setOverlay)
+  const openMachines = useStore((s) => s.openMachines)
   const sessions = useStore((s) => s.sessions)
   const allUsage = useStore((s) => s.usage)
   const [, tick] = useState(0)
@@ -63,11 +66,28 @@ export default function Sidebar(): JSX.Element {
 
   return (
     <aside className="sidebar">
+      <MachineTree />
+
       {session ? (
         <>
           <Section title="Session" aside={elapsed(session.createdAt)}>
             <div className="side-title">{session.title}</div>
             <Row k="harness" v={PROVIDER_NAME[session.provider]} />
+            {session.host && session.host !== LOCAL_HOST ? (
+              <button
+                className="side-folder"
+                title={`Runs on @${session.host}${session.remote ? ` in tmux ${session.remote.tmux}` : ''} — click for machine details`}
+                onClick={() => openMachines({ focus: session.host })}
+              >
+                <span className="row-k">host</span>
+                <span className={`row-v side-host link-${session.remote?.link ?? 'attached'}`}>
+                  {session.remote && session.remote.link !== 'attached' && <span className="side-link mono">{session.remote.link}</span>}
+                  <AliasChip alias={session.host} />
+                </span>
+              </button>
+            ) : (
+              <Row k="host" v="this Mac" dim />
+            )}
             {isAgent && <Row k="account" v={account?.label ?? '—'} />}
             {usage?.model && <Row k="model" v={usage.model.replace('claude-', '')} />}
             <button

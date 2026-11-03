@@ -1,6 +1,6 @@
 import { useStore } from '../state/store'
-import { leaves } from '../state/tree'
-import type { Tab } from '@shared/types'
+import { leafSession, leaves } from '../state/tree'
+import { LOCAL_HOST, type SessionMeta, type Tab } from '@shared/types'
 
 /** The top rule: traffic-light inset, tabs, then a single new-session affordance. */
 export default function TabBar(): JSX.Element {
@@ -14,7 +14,7 @@ export default function TabBar(): JSX.Element {
 
   const statusOf = (tab: Tab): string => {
     const metas = leaves(tab.root)
-      .map((l) => (l.sessionId ? sessions[l.sessionId] : undefined))
+      .map((l) => { const sid = leafSession(l); return sid ? sessions[sid] : undefined })
       .filter(Boolean)
     if (metas.some((m) => m!.status === 'working')) return 'working'
     if (metas.some((m) => m!.status === 'handoff')) return 'handoff'
@@ -22,9 +22,10 @@ export default function TabBar(): JSX.Element {
     return 'idle'
   }
 
-  const providerOf = (tab: Tab): string | undefined => {
+  const focusedMeta = (tab: Tab): SessionMeta | undefined => {
     const pane = leaves(tab.root).find((l) => l.id === tab.focusedPaneId) ?? leaves(tab.root)[0]
-    return pane?.sessionId ? sessions[pane.sessionId]?.provider : undefined
+    const sid = pane ? leafSession(pane) : null
+    return sid ? sessions[sid] : undefined
   }
 
   return (
@@ -33,7 +34,9 @@ export default function TabBar(): JSX.Element {
       <div className="tabs">
         {tabs.map((tab) => {
           const active = tab.id === activeTabId
-          const provider = providerOf(tab)
+          const meta = focusedMeta(tab)
+          const provider = meta?.provider
+          const remote = meta && meta.host && meta.host !== LOCAL_HOST ? meta : undefined
           const paneCount = leaves(tab.root).length
           return (
             <div
@@ -41,11 +44,17 @@ export default function TabBar(): JSX.Element {
               className={`tab ${active ? 'tab-active' : ''}`}
               onClick={() => selectTab(tab.id)}
               onDoubleClick={() => { selectTab(tab.id); setOverlay('rename') }}
-              title={`${tab.title}${paneCount > 1 ? ` · ${paneCount} panes` : ''}`}
+              title={`${tab.title}${remote ? ` · on @${remote.host}` : ''}${paneCount > 1 ? ` · ${paneCount} panes` : ''}`}
             >
               <span className={`dot dot-${statusOf(tab)}`} />
               {provider && <span className={`prov-dot prov-${provider}`} />}
               <span className="tab-title">{tab.title}</span>
+              {remote && (
+                <span
+                  className={`tab-host mono link-${remote.remote?.link ?? 'attached'}`}
+                  title={remote.remote?.link === 'lost' ? `Connection to @${remote.host} lost` : `Running on @${remote.host}`}
+                >@{remote.host}</span>
+              )}
               {paneCount > 1 && <span className="tab-panes mono">{paneCount}</span>}
               <button
                 className="tab-close"

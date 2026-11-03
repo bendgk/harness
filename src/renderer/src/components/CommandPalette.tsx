@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react'
 import Modal from './Modal'
 import { useStore } from '../state/store'
 import { PANE_WIDGETS } from '../widgets/panes'
+import { LOCAL_HOST } from '@shared/types'
+import { canLaunch } from '../lib/machines'
 
 interface Command {
   id: string
@@ -47,6 +49,10 @@ export default function CommandPalette(): JSX.Element {
         run: () => store.setOverlay('switch') },
       { id: 'accounts', group: 'Accounts', label: 'Manage accounts…', hint: '⌘,',
         run: () => store.setOverlay('accounts') },
+      { id: 'machines', group: 'Machines', label: 'Manage machines…', hint: '⌘⇧M',
+        run: () => store.openMachines() },
+      { id: 'machines.add', group: 'Machines', label: 'Add a machine…',
+        run: () => store.openMachines({ adding: true }) },
       { id: 'split.row', group: 'Layout', label: 'Split right', hint: '⌘D', run: () => store.split('row') },
       { id: 'split.col', group: 'Layout', label: 'Split down', hint: '⌘⇧D', run: () => store.split('col') },
       { id: 'pane.close', group: 'Layout', label: 'Close pane', hint: '⌘X', run: () => store.closePane() },
@@ -71,8 +77,39 @@ export default function CommandPalette(): JSX.Element {
         { id: 'restart', group: 'Agent', label: 'Restart session (keeps context)', hint: '⌘R',
           run: () => window.paper.session.restart(session.id) },
         { id: 'rename', group: 'Agent', label: 'Rename session…', hint: '⌘⇧R',
-          run: () => store.setOverlay('rename') }
+          run: () => store.setOverlay('rename') },
+        { id: 'move', group: 'Agent', label: 'Move to machine…', hint: '⌘⇧P',
+          run: () => store.setOverlay('move') }
       )
+      if (session.host && session.host !== LOCAL_HOST) {
+        list.push({ id: 'move.local', group: 'Agent', label: 'Move back to this Mac', hint: `from @${session.host}`,
+          run: () => store.moveToMachine({ host: LOCAL_HOST }) })
+      }
+    }
+
+    // Every machine gets its own launchers, and a direct move for the focused session.
+    for (const m of store.machines) {
+      const where = `@${m.alias}`
+      const launch = (provider: 'claude' | 'codex' | 'shell', label: string): Command => {
+        const gate = canLaunch(m, provider)
+        return {
+          id: `on.${m.alias}.${provider}`,
+          group: 'Machines',
+          label: `${label} on ${where}`,
+          hint: gate.ok ? m.label : gate.reason,
+          // A machine that cannot take it opens its details, where the reason and the fix are.
+          run: () => (gate.ok ? store.newTab({ provider, host: m.alias }) : store.openMachines({ focus: m.alias }))
+        }
+      }
+      list.push(launch('claude', 'New Claude'), launch('codex', 'New Codex'), launch('shell', 'New terminal'))
+      if (session && session.host !== m.alias) {
+        const gate = canLaunch(m, session.provider)
+        list.push({
+          id: `move.${m.alias}`, group: 'Machines', label: `Move session to ${where}`,
+          hint: gate.ok ? 'keeps context' : gate.reason,
+          run: () => (gate.ok ? store.moveToMachine({ host: m.alias }) : store.openMachines({ focus: m.alias }))
+        })
+      }
     }
 
     // Placing a widget straight from the palette skips the picker entirely.

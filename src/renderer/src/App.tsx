@@ -7,6 +7,10 @@ import CommandPalette from './components/CommandPalette'
 import CwdPalette from './components/CwdPalette'
 import SwitchAccount from './components/SwitchAccount'
 import AccountsPanel from './components/AccountsPanel'
+import MachinesPanel from './components/MachinesPanel'
+import MoveMachine from './components/MoveMachine'
+import { AliasChip } from './components/HostTag'
+import { LOCAL_HOST } from '@shared/types'
 import {
   FindBar, HandoffOverlay, PaneWidgetSheet, RenameSheet, SteerSheet, Toast, WidgetSheet
 } from './components/Sheets'
@@ -15,6 +19,7 @@ import { leaves } from './state/tree'
 import { shortPath } from './components/Pane'
 import './styles/theme.css'
 import './styles/app.css'
+import './styles/machines.css'
 
 const api = window.paper
 
@@ -60,6 +65,8 @@ export default function App(): JSX.Element {
         case 'session.clear': window.dispatchEvent(new CustomEvent('paper:clear')); break
         case 'account.switch': s.setOverlay('switch'); break
         case 'accounts.open': s.setOverlay('accounts'); break
+        case 'machines.open': if (s.overlay === 'machines') s.setOverlay(null); else s.openMachines(); break
+        case 'session.moveMachine': s.setOverlay('move'); break
         case 'palette.open': s.setOverlay(s.overlay === 'palette' ? null : 'palette'); break
         case 'pane.split.row': void s.split('row'); break
         case 'pane.split.col': void s.split('col'); break
@@ -135,6 +142,9 @@ export default function App(): JSX.Element {
               : 'no session'}
           </span>
           {session && <span className="status-sep">·</span>}
+          {session && session.host && session.host !== LOCAL_HOST && (
+            <AliasChip alias={session.host} onClick={() => store.openMachines({ focus: session.host })} title="Machine details (⌘⇧M)" />
+          )}
           {session && <span className="status-dim mono">{shortPath(session.cwd)}</span>}
           <span className="status-grow" />
           <button className="status-btn" onClick={() => store.toggleTheme()}>
@@ -155,6 +165,8 @@ export default function App(): JSX.Element {
       {store.overlay === 'widgets' && <WidgetSheet />}
       {store.overlay === 'panewidgets' && <PaneWidgetSheet />}
       {store.overlay === 'cwd' && <CwdPalette />}
+      {store.overlay === 'machines' && <MachinesPanel />}
+      {store.overlay === 'move' && <MoveMachine />}
     </div>
   )
 }

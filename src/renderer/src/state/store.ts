@@ -1,8 +1,11 @@
 import { create } from 'zustand'
-import type {
-  Account, DropZone, PaneContent, PaneNode, ProviderId, SessionMeta, SpawnRequest, Tab,
-  UsageSnapshot, WidgetPrefs
+import {
+  LOCAL_HOST,
+  type Account, type DropZone, type Machine, type MachineError, type MachineHandoffRequest, type MachineInventory, type PaneContent,
+  type PaneNode, type ProviderId, type SessionMeta, type SpawnRequest, type Tab, type UsageSnapshot, type WidgetPrefs
 } from '@shared/types'
+import { fake, fakesOn, decorate } from '../lib/dev-fakes'
+import { cleanIpcError } from '../lib/machines'
 import {
   leaf, leafSession, leaves, migrateNode, movePane, neighbourLeaf, patchWidgetProps, removePane,
   resizeSplit, setPaneContent, setPaneSession, splitPane, terminalLeaf, uid
@@ -10,12 +13,53 @@ import {
 
 export type Overlay =
   | null | 'palette' | 'accounts' | 'switch' | 'steer' | 'rename' | 'widgets' | 'panewidgets' | 'cwd'
+  | 'machines' | 'move'
 
 interface HandoffState {
   sessionId: string
   stage: string
   detail?: string
+  /** 'machine' handoffs keep a failure on screen, because its hint is something the human must do. */
+  kind?: 'account' | 'machine'
+  /** Where a machine handoff is going (LOCAL_HOST or an alias). */
+  target?: string
+  /** 'agent' when the agent moved itself (no one in this window asked). */
+  initiator?: 'user' | 'agent'
   error?: string
+}
+
+/** The @-mention dropdown, wherever it is open (a terminal pane or one of Paper's own inputs). */
+export interface MentionState {
+  /** 'term:<sessionId>' or 'input:<name>' — who owns the dropdown. */
+  owner: string
+  /** What follows the @ so far. */
+  query: string
+  /** Aliases currently offered, best first. */
+  matches: string[]
+  index: number
+  /** Passive: shown for discovery but not taking keys (a bare "@" in a terminal). */
+  passive: boolean
+}
+
+export type MachinePatch = Parameters<typeof window.paper.machines.update>[1]
+
+/** One machine's reverse tunnel, as `gateway_status` reports it (mirrors TunnelState in main/gateway.ts). */
+export interface TunnelState {
+  alias: string
+  remotePort: number
+  state: 'down' | 'connecting' | 'up' | 'failed'
+  error?: MachineError
+  since: number
+}
+export interface GatewayStatus { port: number | null; tunnels: TunnelState[]; tokens: number }
+
+/** Machines panel view state, kept in the store so ui_state shows it. */
+export interface MachinesPanelState {
+  /** Machine scrolled to and highlighted (e.g. after clicking an @alias in a terminal). */
+  focus: string | null
+  adding: boolean
+  editing: string | null
+  confirmRemove: string | null
 }
 
 interface State {
@@ -39,6 +83,26 @@ interface State {
   fontSize: number
   handoff: HandoffState | null
   toast: { text: string; tone?: 'ok' | 'warn' } | null
+
+  /** Registered remote computers (ssh aliases). */
+  machines: Machine[]
+  /** Aliases with an ssh probe (Test, or the probe that follows Add) in flight. */
+  probing: Record<string, boolean>
+  /** Ground truth per machine: the agents actually running there. */
+  inventory: Record<string, MachineInventory>
+  inventoryLoading: boolean
+  machinesPanel: MachinesPanelState
+  /** Host an empty pane will launch on, when it is not this Mac. Keyed by pane id; not persisted. */
+  paneHost: Record<string, string>
+  mention: MentionState | null
+  /** Last time each session printed anything (sampled, not per chunk). */
+  lastActivity: Record<string, number>
+  /** Tree rows the user folded ('local' or an alias); mirrored to localStorage. */
+  treeCollapsed: string[]
+  /** True when the dev-only machine fakes are standing in for main (see lib/dev-fakes.ts). */
+  devFakes: boolean
+  /** Reverse-tunnel gateway (remote agents → Paper tools), from the gateway_status tool; null if not served. */
+  gateway: GatewayStatus | null
 
   init: () => Promise<void>
   newTab: (req?: Partial<SpawnRequest>) => Promise<void>
@@ -75,9 +139,33 @@ interface State {
   paneCwd: () => string
   setPaneCwd: (paneId: string, cwd: string) => void
   retarget: (cwd: string) => Promise<void>
-  notify: (text: string, tone?: 'ok' | 'warn') => void
+  notify: (text: string, tone?: 'ok' | 'warn', ms?: number) => void
   refreshAccounts: () => Promise<void>
   switchAccount: (accountId: string) => Promise<void>
+
+  refreshMachines: () => Promise<void>
+  addMachine: (input: { alias: string; label?: string; note?: string; defaultCwd?: string }) => Promise<Machine | null>
+  updateMachine: (alias: string, patch: MachinePatch) => Promise<void>
+  removeMachine: (alias: string) => Promise<void>
+  probeMachine: (alias: string) => Promise<void>
+  /** Open the Machines panel, optionally scrolled to one machine or straight into "add". */
+  openMachines: (opts?: { focus?: string; adding?: boolean }) => void
+  setMachinesPanel: (patch: Partial<MachinesPanelState>) => void
+  setPaneHost: (paneId: string, host: string) => void
+  /** Host the given (default: focused) pane runs on, or will launch on. */
+  paneHostOf: (paneId?: string) => string
+  moveToMachine: (req: Omit<MachineHandoffRequest, 'sessionId'> & { sessionId?: string }) => Promise<void>
+  dismissHandoff: () => void
+  refreshInventory: (force?: boolean) => Promise<void>
+  /** Bring a detached remote agent into Paper and show it in a new tab. */
+  adoptAgent: (alias: string, tmux: string) => Promise<void>
+  /** Show a live session: switch to the tab that has it, or open a new tab attached to it. */
+  revealSession: (sessionId: string) => void
+  setMention: (m: MentionState | null) => void
+  toggleTreeCollapsed: (key: string) => void
+  refreshGateway: () => Promise<void>
+  /** ssh config aliases for the "Add machine" picker. */
+  suggestMachines: () => Promise<{ alias: string; hostname?: string; user?: string; registered: boolean }[]>
 }
 
 const api = window.paper
@@ -106,6 +194,17 @@ export const useStore = create<State>((set, get) => ({
   fontSize: 12.5,
   handoff: null,
   toast: null,
+  machines: [],
+  probing: {},
+  inventory: {},
+  inventoryLoading: false,
+  machinesPanel: { focus: null, adding: false, editing: null, confirmRemove: null },
+  paneHost: {},
+  mention: null,
+  lastActivity: {},
+  treeCollapsed: readCollapsed(),
+  devFakes: fakesOn(),
+  gateway: null,
 
   async init() {
     // StrictMode mounts twice in dev, and a hot update re-runs App's effect;
@@ -115,7 +214,9 @@ export const useStore = create<State>((set, get) => ({
     booting = (async () => {
       const snap = await api.snapshot()
       const sessions: Record<string, SessionMeta> = {}
-      for (const s of snap.sessions) sessions[s.id] = s
+      for (const s of snap.sessions) { if (fakesOn()) fake.remember(s); sessions[s.id] = decorate(s) }
+      // With the dev fakes on, the registry lives in the renderer instead.
+      const machines = fakesOn() ? await fake.machines.list() : snap.machines ?? []
 
       // Panes restored from disk may point at processes that no longer exist
       // (a previous run) or at ones still alive in the main process (a page
@@ -129,6 +230,7 @@ export const useStore = create<State>((set, get) => ({
         defaults: snap.defaults,
         widgets: snap.widgets,
         recentDirs: snap.recentDirs ?? [],
+        machines,
         sessions,
         tabs,
         activeTabId: snap.activeTabId && tabs.some((t) => t.id === snap.activeTabId) ? snap.activeTabId : tabs[0]?.id ?? null
@@ -199,8 +301,11 @@ export const useStore = create<State>((set, get) => ({
     // starts in the same directory rather than back at the global default.
     const fresh = leaf({ type: 'terminal', sessionId: null, cwd: get().paneCwd() })
     const root = splitPane(tab.root, tab.focusedPaneId, dir, fresh)
+    // …and on the same computer: a split of a pane on @g6e offers @g6e first.
+    const host = get().paneHostOf()
     set((s) => ({
-      tabs: s.tabs.map((t) => (t.id === tab.id ? { ...t, root, focusedPaneId: fresh.id } : t))
+      tabs: s.tabs.map((t) => (t.id === tab.id ? { ...t, root, focusedPaneId: fresh.id } : t)),
+      paneHost: host !== LOCAL_HOST ? { ...s.paneHost, [fresh.id]: host } : s.paneHost
     }))
     persist()
   },
@@ -319,19 +424,27 @@ export const useStore = create<State>((set, get) => ({
     if (!tab) return
     const pane = leaves(tab.root).find((l) => l.id === tab.focusedPaneId)
     const paneCwd = pane?.content.type === 'terminal' ? pane.content.cwd : undefined
+    const host = req.host ?? get().paneHost[tab.focusedPaneId] ?? LOCAL_HOST
+    const machine = get().machines.find((m) => m.alias === host)
+    // A local folder means nothing on another computer: a remote launch uses
+    // the machine's default directory, or lets main pick (same path → ~-relative).
+    const cwd = host === LOCAL_HOST ? req.cwd ?? paneCwd ?? defaults.cwd : req.cwd ?? machine?.defaultCwd
     try {
-      const meta = await api.session.spawn({
+      const spawnReq: SpawnRequest = {
         provider: req.provider ?? defaults.provider,
         accountId: req.accountId,
-        cwd: req.cwd ?? paneCwd ?? defaults.cwd,
+        cwd,
         resume: req.resume,
-        prompt: req.prompt
-      })
+        prompt: req.prompt,
+        host
+      }
+      const meta = fakesOn() ? await fake.spawn(spawnReq) : await api.session.spawn(spawnReq)
       set((s) => ({ sessions: { ...s.sessions, [meta.id]: meta } }))
       get().attachSession(tab.focusedPaneId, meta.id)
       syncTabTitles()
     } catch (err) {
-      get().notify((err as Error).message, 'warn')
+      // Remote failures carry a hint for the human; give it time to be read.
+      get().notify(cleanIpcError(err), 'warn', host !== LOCAL_HOST ? 9000 : undefined)
     }
   },
 
@@ -407,9 +520,9 @@ export const useStore = create<State>((set, get) => ({
     set({ widgets })
     void api.setWidgets(widgets)
   },
-  notify(text, tone) {
+  notify(text, tone, ms = 3200) {
     set({ toast: { text, tone } })
-    setTimeout(() => set((s) => (s.toast?.text === text ? { toast: null } : s)), 3200)
+    setTimeout(() => set((s) => (s.toast?.text === text ? { toast: null } : s)), ms)
   },
 
   async refreshAccounts() {
@@ -419,15 +532,221 @@ export const useStore = create<State>((set, get) => ({
   async switchAccount(accountId) {
     const session = get().activeSession()
     if (!session) return
-    set({ handoff: { sessionId: session.id, stage: 'Starting handoff' }, overlay: null })
+    set({ handoff: { sessionId: session.id, stage: 'Starting handoff', kind: 'account', initiator: 'user' }, overlay: null })
     try {
       await api.handoff.switchAccount(session.id, accountId)
     } catch (err) {
       set({ handoff: null })
-      get().notify((err as Error).message, 'warn')
+      get().notify(cleanIpcError(err), 'warn')
     }
+  },
+
+  async refreshMachines() {
+    try {
+      set({ machines: await machinesApi().list() })
+    } catch { /* main without a registry yet: keep the snapshot's list */ }
+  },
+
+  async addMachine(input) {
+    const alias = input.alias.trim().replace(/^@/, '')
+    set((s) => ({ probing: { ...s.probing, [alias]: true } }))
+    try {
+      const m = await machinesApi().add({ ...input, alias })
+      // Upsert now rather than waiting for machines:update, so the row is
+      // there the moment the spinner stops.
+      set((s) => ({ machines: [...s.machines.filter((x) => x.alias !== m.alias), m] }))
+      void get().refreshInventory(true)
+      void get().refreshGateway()
+      return m
+    } catch (err) {
+      get().notify(cleanIpcError(err), 'warn', 6000)
+      return null
+    } finally {
+      set((s) => ({ probing: omit(s.probing, alias) }))
+    }
+  },
+
+  async updateMachine(alias, patch) {
+    try {
+      const m = await machinesApi().update(alias, patch)
+      set((s) => ({ machines: s.machines.map((x) => (x.alias === alias ? m : x)) }))
+    } catch (err) {
+      get().notify(cleanIpcError(err), 'warn')
+    }
+  },
+
+  async removeMachine(alias) {
+    try {
+      await machinesApi().remove(alias)
+      set((s) => ({
+        machines: s.machines.filter((m) => m.alias !== alias),
+        inventory: omit(s.inventory, alias),
+        machinesPanel: { ...s.machinesPanel, confirmRemove: null, editing: null }
+      }))
+      get().notify(`Removed @${alias}`)
+    } catch (err) {
+      get().notify(cleanIpcError(err), 'warn')
+    }
+  },
+
+  async probeMachine(alias) {
+    set((s) => ({ probing: { ...s.probing, [alias]: true } }))
+    try {
+      const probe = await machinesApi().probe(alias)
+      set((s) => ({ machines: s.machines.map((m) => (m.alias === alias ? { ...m, probe } : m)) }))
+    } catch (err) {
+      get().notify(cleanIpcError(err), 'warn')
+    } finally {
+      set((s) => ({ probing: omit(s.probing, alias) }))
+    }
+  },
+
+  openMachines(opts = {}) {
+    set({
+      overlay: 'machines',
+      machinesPanel: { focus: opts.focus ?? null, adding: !!opts.adding, editing: null, confirmRemove: null }
+    })
+  },
+
+  setMachinesPanel(patch) {
+    set((s) => ({ machinesPanel: { ...s.machinesPanel, ...patch } }))
+  },
+
+  setPaneHost(paneId, host) {
+    set((s) => ({ paneHost: host === LOCAL_HOST ? omit(s.paneHost, paneId) : { ...s.paneHost, [paneId]: host } }))
+  },
+
+  paneHostOf(paneId) {
+    const tab = get().activeTab()
+    const id = paneId ?? tab?.focusedPaneId
+    const pane = tab && id ? leaves(tab.root).find((l) => l.id === id) : undefined
+    const sid = pane ? leafSession(pane) : null
+    const meta = sid ? get().sessions[sid] : undefined
+    return meta?.host ?? (id ? get().paneHost[id] : undefined) ?? LOCAL_HOST
+  },
+
+  async moveToMachine(req) {
+    const sessionId = req.sessionId ?? get().activeSession()?.id
+    if (!sessionId) return
+    const full: MachineHandoffRequest = { ...req, sessionId }
+    set({
+      handoff: {
+        sessionId, kind: 'machine', target: req.host, initiator: 'user',
+        stage: req.host === LOCAL_HOST ? 'Moving back to this Mac' : `Moving to @${req.host}`
+      },
+      overlay: null
+    })
+    try {
+      await (fakesOn() ? fake.toMachine(full) : api.handoff.toMachine(full))
+    } catch (err) {
+      // Main normally reports failure through handoff:progress; a rejected
+      // invoke (validation, a missing handler) must not leave the spinner up.
+      set((s) => ({
+        handoff: {
+          sessionId, kind: 'machine', target: req.host, initiator: 'user',
+          stage: s.handoff?.stage ?? 'Handoff', error: cleanIpcError(err)
+        }
+      }))
+    }
+  },
+
+  dismissHandoff() { set({ handoff: null }) },
+
+  async refreshInventory(force = false) {
+    if (!get().machines.length) return
+    set({ inventoryLoading: true })
+    try {
+      const list = await machinesApi().inventory(force)
+      set((s) => {
+        const inventory = { ...s.inventory }
+        for (const inv of list) inventory[inv.alias] = inv
+        return { inventory }
+      })
+    } catch { /* inventory not served yet; the tree falls back to live sessions */ }
+    finally { set({ inventoryLoading: false }) }
+  },
+
+  async adoptAgent(alias, tmux) {
+    try {
+      const meta = await machinesApi().adopt(alias, tmux)
+      set((s) => ({ sessions: { ...s.sessions, [meta.id]: meta } }))
+      get().revealSession(meta.id)
+      void get().refreshInventory(true)
+    } catch (err) {
+      get().notify(cleanIpcError(err), 'warn', 9000)
+    }
+  },
+
+  revealSession(sessionId) {
+    for (const t of get().tabs) {
+      const pane = leaves(t.root).find((l) => leafSession(l) === sessionId)
+      if (pane) {
+        set((s) => ({
+          activeTabId: t.id,
+          tabs: s.tabs.map((x) => (x.id === t.id ? { ...x, focusedPaneId: pane.id } : x))
+        }))
+        persist()
+        return
+      }
+    }
+    // Not on screen anywhere: a tab of its own, never a split of whatever is focused.
+    const tab = newTabObject(sessionId)
+    set((s) => ({ tabs: [...s.tabs, tab], activeTabId: tab.id }))
+    syncTabTitles()
+    persist()
+  },
+
+  setMention(mention) {
+    const cur = get().mention
+    if (!mention && !cur) return
+    if (mention && cur && cur.owner === mention.owner && cur.query === mention.query && cur.index === mention.index &&
+      cur.passive === mention.passive && cur.matches.join() === mention.matches.join()) return
+    set({ mention })
+  },
+
+  async suggestMachines() {
+    try { return await machinesApi().suggest() } catch { return [] }
+  },
+
+  async refreshGateway() {
+    if (fakesOn()) { set({ gateway: fake.gatewayStatus() }); return }
+    try {
+      const res = await api.tools.invoke('gateway_status')
+      set({ gateway: res.isError ? null : (res.json as GatewayStatus) })
+    } catch { set({ gateway: null }) }
+  },
+
+  toggleTreeCollapsed(key) {
+    const cur = get().treeCollapsed
+    const treeCollapsed = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]
+    set({ treeCollapsed })
+    try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(treeCollapsed)) } catch { /* private mode: in-memory only */ }
   }
 }))
+
+const COLLAPSE_KEY = 'paper:tree-collapsed'
+function readCollapsed(): string[] {
+  try {
+    const v: unknown = JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? '[]')
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+  } catch { return [] }
+}
+
+function omit<T>(rec: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in rec)) return rec
+  const rest = { ...rec }
+  delete rest[key]
+  return rest
+}
+
+/** The machine registry: main's, or the dev fake when it is switched on. */
+function machinesApi(): typeof api.machines {
+  return fakesOn() ? fake.machines : api.machines
+}
+
+/** Machine for an alias (undefined for LOCAL_HOST or an unknown alias). */
+export const machineOf = (alias: string | undefined): Machine | undefined =>
+  alias ? useStore.getState().machines.find((m) => m.alias === alias) : undefined
 
 /** Drop session ids that no longer name a live process; keep the ones that do. */
 function pruneSessions(node: PaneNode, live: Set<string>): PaneNode {
@@ -446,26 +765,69 @@ let unbind: (() => void) | null = null
 function bind(): void {
   unbind?.()
   const { setState: set, getState: get } = useStore
+  const onSession = (raw: SessionMeta): void => {
+    if (fakesOn()) fake.remember(raw)
+    const meta = decorate(raw)
+    set((s) => ({ sessions: { ...s.sessions, [meta.id]: meta } }))
+    syncTabTitles()
+  }
+  const onHandoff = (p: { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }): void => {
+    const cur = get().handoff
+    // A handoff this window did not start was asked for by the agent itself
+    // (the session_handoff tool). Work out where it is going from the stage
+    // text, so the overlay can say so instead of looking like a glitch.
+    const mine = cur?.sessionId === p.sessionId ? cur : null
+    const text = `${p.stage} ${p.detail ?? ''}`
+    const named = get().machines.find((m) => text.includes(`@${m.alias}`))?.alias
+    const inferred = named ?? (/this mac|locally|back here/i.test(text) ? LOCAL_HOST : undefined)
+    const base: HandoffState = mine ?? {
+      sessionId: p.sessionId, stage: p.stage, initiator: 'agent',
+      kind: inferred ? 'machine' : 'account', target: inferred
+    }
+    const target = base.target ?? inferred
+    if (p.done && p.error && base.kind === 'machine') {
+      // Stays up until dismissed: the hint is an instruction (load a key, install tmux…).
+      set({ handoff: { ...base, target, stage: p.stage, detail: undefined, error: p.error } })
+    } else if (p.done) {
+      set({ handoff: null })
+      if (base.kind === 'machine' && target) {
+        const title = get().sessions[p.sessionId]?.title ?? 'The agent'
+        const where = target === LOCAL_HOST ? 'this Mac' : `@${target}`
+        get().notify(base.initiator === 'agent'
+          ? `${title} moved itself to ${where}`
+          : target === LOCAL_HOST ? 'Back on this Mac, context intact' : `Now running on @${target}, context intact`)
+        void get().refreshInventory(true)
+      } else {
+        get().notify(p.error ? `Handoff failed: ${p.error}` : 'Context handed off', p.error ? 'warn' : 'ok')
+      }
+    } else {
+      set({ handoff: { ...base, target, stage: p.stage, detail: p.detail, error: undefined } })
+    }
+  }
+  const onMachines = (machines: Machine[]): void => set({ machines })
+  const onInventory = (inv: MachineInventory): void => set((s) => ({ inventory: { ...s.inventory, [inv.alias]: inv } }))
   const offs = [
-    api.onSession((meta) => {
-      set((s) => ({ sessions: { ...s.sessions, [meta.id]: meta } }))
-      syncTabTitles()
+    api.onSession(onSession),
+    api.onMachines(onMachines),
+    api.onInventory(onInventory),
+    // Last-output times feed the tree's "last activity". Sampled at most every
+    // few seconds per session, so a streaming agent does not re-render the app.
+    api.onPtyData(({ sessionId }) => {
+      const now = Date.now()
+      if (now - (get().lastActivity[sessionId] ?? 0) < 5000) return
+      set((s) => ({ lastActivity: { ...s.lastActivity, [sessionId]: now } }))
     }),
     api.onUsage((u) => set((s) => ({ usage: { ...s.usage, [u.sessionId]: u } }))),
     api.onAccounts((accounts) => set({ accounts })),
-    api.onHandoff((p) => {
-      if (p.done) {
-        set({ handoff: null })
-        get().notify(p.error ? `Handoff failed: ${p.error}` : 'Context handed off', p.error ? 'warn' : 'ok')
-      } else {
-        set({ handoff: { sessionId: p.sessionId, stage: p.stage, detail: p.detail } })
-      }
-    }),
+    api.onHandoff(onHandoff),
     api.onPtyExit(({ sessionId }) => {
       const meta = get().sessions[sessionId]
       if (meta) set((s) => ({ sessions: { ...s.sessions, [sessionId]: { ...meta, status: 'exited' } } }))
     }),
-    api.onHot(({ generation }) => get().notify(`main process reloaded · generation ${generation}`))
+    api.onHot(({ generation }) => get().notify(`main process reloaded · generation ${generation}`)),
+    ...(fakesOn()
+      ? [fake.onSession(onSession), fake.onHandoff(onHandoff), fake.onMachines(onMachines), fake.onInventory(onInventory)]
+      : [])
   ]
   unbind = () => { for (const off of offs) off(); unbind = null }
 }
