@@ -1,11 +1,12 @@
 import { create } from 'zustand'
 import {
   LOCAL_HOST,
-  type Account, type DropZone, type Machine, type MachineError, type MachineHandoffRequest, type MachineInventory, type PaneContent,
+  type Account, type AgentSummary, type DropZone, type Machine, type MachineError, type MachineHandoffRequest, type MachineInventory, type PaneContent,
   type PaneNode, type ProviderId, type SessionMeta, type SpawnRequest, type Tab, type UsageSnapshot, type WidgetPrefs
 } from '@shared/types'
 import { fake, fakesOn, decorate } from '../lib/dev-fakes'
 import { cleanIpcError } from '../lib/machines'
+import { agentNameProblem, agentSummaries, knownAgentNames, normaliseAgentName } from '../lib/agents'
 import {
   leaf, leafSession, leaves, migrateNode, movePane, neighbourLeaf, patchWidgetProps, removePane,
   resizeSplit, setPaneContent, setPaneSession, splitPane, terminalLeaf, uid
@@ -13,7 +14,7 @@ import {
 
 export type Overlay =
   | null | 'palette' | 'accounts' | 'switch' | 'steer' | 'rename' | 'widgets' | 'panewidgets' | 'cwd'
-  | 'machines' | 'move'
+  | 'machines' | 'move' | 'agentName'
 
 interface HandoffState {
   sessionId: string
@@ -34,11 +35,34 @@ export interface MentionState {
   owner: string
   /** What follows the @ so far. */
   query: string
-  /** Aliases currently offered, best first. */
+  /** Completions offered, best first: agent names, then machine aliases. */
   matches: string[]
+  /** How many leading entries of `matches` are agent names (the Agents section). */
+  agents: number
   index: number
   /** Passive: shown for discovery but not taking keys (a bare "@" in a terminal). */
   passive: boolean
+}
+
+/** An agent callsign being edited, wherever the editor is (one at a time). */
+export interface RenamingState {
+  sessionId: string
+  /** Which editor: 'tree' (inline row), 'side' (SESSION card) or 'sheet' (palette / header). */
+  where: 'tree' | 'side' | 'sheet'
+  /** The name before editing. */
+  current: string
+  draft: string
+  /** Live validation, or the message setName threw. */
+  error: string | null
+  saving: boolean
+}
+
+/** The hover card for an agent chip: which agent, and the chip's box to sit beside. */
+export interface AgentCardState {
+  name: string
+  rect: { left: number; top: number; right: number; bottom: number }
+  /** Which side of the chip the card opens on. */
+  side: 'left' | 'right' | 'below'
 }
 
 export type MachinePatch = Parameters<typeof window.paper.machines.update>[1]
@@ -103,6 +127,13 @@ interface State {
   devFakes: boolean
   /** Reverse-tunnel gateway (remote agents → Paper tools), from the gateway_status tool; null if not served. */
   gateway: GatewayStatus | null
+  /** Last `agents.list()` result (what each named agent is doing). Merge with live sessions via agentSummaries. */
+  agents: AgentSummary[]
+  agentsAt: number | null
+  /** Who answered: main, the dev fake, or nobody yet ('fallback': names come from sessions + inventory only). */
+  agentsSource: 'main' | 'fake' | 'fallback'
+  renaming: RenamingState | null
+  agentCard: AgentCardState | null
 
   init: () => Promise<void>
   newTab: (req?: Partial<SpawnRequest>) => Promise<void>
@@ -164,6 +195,17 @@ interface State {
   setMention: (m: MentionState | null) => void
   toggleTreeCollapsed: (key: string) => void
   refreshGateway: () => Promise<void>
+  /** Re-read agents.list(); calls within ~1.5 s of the last one are dropped unless forced. */
+  refreshAgents: (force?: boolean) => Promise<void>
+  /** Show the agent called `name`: its tab, a new tab, or adopt it from its machine first. */
+  goToAgent: (name: string) => Promise<void>
+  beginRename: (sessionId: string, where: RenamingState['where']) => void
+  setRenameDraft: (draft: string) => void
+  /** Validate and call session.setName; true when the name was saved. */
+  commitRename: () => Promise<boolean>
+  cancelRename: () => void
+  showAgentCard: (card: AgentCardState) => void
+  hideAgentCard: (name?: string) => void
   /** ssh config aliases for the "Add machine" picker. */
   suggestMachines: () => Promise<{ alias: string; hostname?: string; user?: string; registered: boolean }[]>
 }
@@ -205,6 +247,11 @@ export const useStore = create<State>((set, get) => ({
   treeCollapsed: readCollapsed(),
   devFakes: fakesOn(),
   gateway: null,
+  agents: [],
+  agentsAt: null,
+  agentsSource: 'fallback',
+  renaming: null,
+  agentCard: null,
 
   async init() {
     // StrictMode mounts twice in dev, and a hot update re-runs App's effect;
@@ -237,6 +284,7 @@ export const useStore = create<State>((set, get) => ({
       })
       bind()
       syncTabTitles()
+      void get().refreshAgents(true)
       if (!tabs.length) await get().newTab()
     })()
     return booting
@@ -700,8 +748,102 @@ export const useStore = create<State>((set, get) => ({
     const cur = get().mention
     if (!mention && !cur) return
     if (mention && cur && cur.owner === mention.owner && cur.query === mention.query && cur.index === mention.index &&
-      cur.passive === mention.passive && cur.matches.join() === mention.matches.join()) return
+      cur.passive === mention.passive && cur.agents === mention.agents && cur.matches.join() === mention.matches.join()) return
     set({ mention })
+  },
+
+  async refreshAgents(force = false) {
+    const now = Date.now()
+    if (!force && now - lastAgentsCall < 1500) return
+    lastAgentsCall = now
+    try {
+      const list = fakesOn() ? await fake.agents.list() : await api.agents.list()
+      set({ agents: list, agentsAt: Date.now(), agentsSource: fakesOn() ? 'fake' : 'main' })
+    } catch {
+      // main without agents:list yet: names still come from sessions and the inventory.
+      set({ agentsSource: 'fallback' })
+    }
+  },
+
+  async goToAgent(name) {
+    const s = get()
+    const live = Object.values(s.sessions).find((m) => m.name === name)
+    if (live) { s.revealSession(live.id); return }
+    // Detached on a machine: adopt it (by its tmux session), then it opens in a tab.
+    const summary = agentSummaries(s).find((a) => a.name === name)
+    for (const inv of Object.values(s.inventory)) {
+      const h = inv.agents.find((a) => a.name === name || (summary && a.sessionId === summary.sessionId))
+      if (h) { await s.adoptAgent(inv.alias, h.tmux); return }
+    }
+    if (summary && s.sessions[summary.sessionId]) { s.revealSession(summary.sessionId); return }
+    s.notify(`@${name} is not running anywhere Paper can see`, 'warn')
+  },
+
+  beginRename(sessionId, where) {
+    const meta = get().sessions[sessionId]
+    if (!meta?.name || meta.provider === 'shell') return
+    set({ renaming: { sessionId, where, current: meta.name, draft: meta.name, error: null, saving: false }, agentCard: null })
+    if (where === 'sheet') set({ overlay: 'agentName' })
+  },
+
+  setRenameDraft(draft) {
+    const r = get().renaming
+    if (!r) return
+    const s = get()
+    const error = agentNameProblem(draft, {
+      current: r.current,
+      names: knownAgentNames(s).filter((n) => n !== r.current),
+      aliases: s.machines.map((m) => m.alias)
+    })
+    set({ renaming: { ...r, draft, error } })
+  },
+
+  async commitRename() {
+    const r = get().renaming
+    if (!r || r.saving) return false
+    const s = get()
+    const name = normaliseAgentName(r.draft)
+    const error = agentNameProblem(r.draft, {
+      current: r.current,
+      names: knownAgentNames(s).filter((n) => n !== r.current),
+      aliases: s.machines.map((m) => m.alias)
+    })
+    if (error) { set({ renaming: { ...r, error } }); return false }
+    if (name === r.current) { get().cancelRename(); return true }
+    set({ renaming: { ...r, saving: true, error: null } })
+    try {
+      const meta = fakesOn() ? await fake.setName(r.sessionId, name) : await api.session.setName(r.sessionId, name)
+      set((x) => ({
+        sessions: x.sessions[meta.id] ? { ...x.sessions, [meta.id]: decorate(meta) } : x.sessions,
+        agents: x.agents.map((a) => (a.sessionId === meta.id ? { ...a, name } : a)),
+        renaming: null,
+        overlay: x.overlay === 'agentName' ? null : x.overlay
+      }))
+      get().notify(`@${r.current} is now @${name}`)
+      void get().refreshAgents(true)
+      return true
+    } catch (err) {
+      set((x) => ({ renaming: x.renaming ? { ...x.renaming, saving: false, error: cleanIpcError(err) } : null }))
+      return false
+    }
+  },
+
+  cancelRename() {
+    if (!get().renaming) return
+    set((x) => ({ renaming: null, overlay: x.overlay === 'agentName' ? null : x.overlay }))
+  },
+
+  showAgentCard(card) {
+    const cur = get().agentCard
+    if (cur && cur.name === card.name && cur.rect.left === card.rect.left && cur.rect.top === card.rect.top) return
+    set({ agentCard: card })
+    void get().refreshAgents()
+  },
+
+  hideAgentCard(name) {
+    const cur = get().agentCard
+    if (!cur || (name && cur.name !== name)) return
+    set({ agentCard: null })
   },
 
   async suggestMachines() {
@@ -759,6 +901,7 @@ function pruneSessions(node: PaneNode, live: Set<string>): PaneNode {
 }
 
 let booting: Promise<void> | null = null
+let lastAgentsCall = 0
 let unbind: (() => void) | null = null
 
 /** Subscribe to main-process events. Idempotent; the previous subscription is dropped. */
@@ -833,7 +976,12 @@ function bind(): void {
         delete usage[sessionId]
         // Panes that showed it fall back to an empty terminal slot, exactly as after a restart.
         const live = new Set(Object.keys(sessions))
-        return { sessions, usage, tabs: s.tabs.map((t) => ({ ...t, root: pruneSessions(t.root, live) })) }
+        return {
+          sessions, usage,
+          agents: s.agents.filter((a) => a.sessionId !== sessionId),
+          renaming: s.renaming?.sessionId === sessionId ? null : s.renaming,
+          tabs: s.tabs.map((t) => ({ ...t, root: pruneSessions(t.root, live) }))
+        }
       })
     }),
     api.onHot(({ generation }) => get().notify(`main process reloaded · generation ${generation}`)),

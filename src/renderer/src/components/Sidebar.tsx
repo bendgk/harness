@@ -7,6 +7,7 @@ import { shortPath } from './Pane'
 import { LOCAL_HOST, type ProviderId } from '@shared/types'
 import MachineTree from './MachineTree'
 import { AliasChip } from './HostTag'
+import { AgentChip, AgentNameEditor } from './AgentTag'
 
 const PROVIDER_NAME: Record<ProviderId, string> = {
   claude: 'Claude Code',
@@ -45,6 +46,8 @@ export default function Sidebar(): JSX.Element {
   const openMachines = useStore((s) => s.openMachines)
   const sessions = useStore((s) => s.sessions)
   const allUsage = useStore((s) => s.usage)
+  const beginRename = useStore((s) => s.beginRename)
+  const editingName = useStore((s) => !!session && s.renaming?.where === 'side' && s.renaming.sessionId === session.id)
   const [, tick] = useState(0)
 
   // Relative times ("resets in 2h") need a heartbeat to stay honest.
@@ -72,6 +75,26 @@ export default function Sidebar(): JSX.Element {
         <>
           <Section title="Session" aside={elapsed(session.createdAt)}>
             <div className="side-title">{session.title}</div>
+            {isAgent && session.name && (
+              editingName ? (
+                <div className="row side-name-edit">
+                  <span className="row-k">name</span>
+                  <AgentNameEditor where="side" sessionId={session.id} />
+                </div>
+              ) : (
+                <div className="row side-name">
+                  <span className="row-k">name</span>
+                  <span className="row-v side-name-v">
+                    <AgentChip
+                      name={session.name}
+                      title="Other agents and you can mention it as this — double-click to rename"
+                      onDoubleClick={() => beginRename(session.id, 'side')}
+                    />
+                    <button className="side-rename" title="Rename this agent" onClick={() => beginRename(session.id, 'side')}>rename</button>
+                  </span>
+                </div>
+              )
+            )}
             <Row k="harness" v={PROVIDER_NAME[session.provider]} />
             {session.host && session.host !== LOCAL_HOST ? (
               <button

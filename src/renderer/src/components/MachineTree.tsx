@@ -3,6 +3,7 @@ import { useStore } from '../state/store'
 import { LOCAL_HOST, type HostedAgent, type MachineError, type ProviderId, type SessionMeta } from '@shared/types'
 import { ago, machineHealth } from '../lib/machines'
 import { AliasChip, HealthDot } from './HostTag'
+import { AgentChip, AgentNameEditor, agentHover, hideAgentCardNow } from './AgentTag'
 
 type AgentState = 'working' | 'idle' | 'starting' | 'handoff' | 'exited' | 'detached'
 
@@ -11,6 +12,8 @@ export interface TreeAgent {
   key: string
   sessionId?: string
   tmux?: string
+  /** Agent callsign (never on shells): live meta first, else the machine's @paper_name tag. */
+  name?: string
   provider?: ProviderId
   title: string
   cwd?: string
@@ -53,6 +56,7 @@ export function buildTree(s: ReturnType<typeof useStore.getState>): TreeHost[] {
     key: m.id,
     sessionId: m.id,
     tmux: m.remote?.tmux ?? agent?.tmux,
+    name: m.provider === 'shell' ? undefined : m.name ?? agent?.name,
     provider: m.provider,
     title: m.title,
     cwd: m.cwd,
@@ -88,6 +92,7 @@ export function buildTree(s: ReturnType<typeof useStore.getState>): TreeHost[] {
       agents.push({
         key: `${machine.alias}:${a.tmux}`,
         tmux: a.tmux,
+        name: a.name,
         provider: a.provider,
         title: a.title || a.command || a.tmux,
         cwd: a.cwd,
@@ -124,6 +129,7 @@ export default function MachineTree(): JSX.Element {
   const loading = useStore((s) => s.inventoryLoading)
   const toggle = useStore((s) => s.toggleTreeCollapsed)
   const refresh = useStore((s) => s.refreshInventory)
+  const refreshAgents = useStore((s) => s.refreshAgents)
   const openMachines = useStore((s) => s.openMachines)
   const hasMachines = useStore((s) => s.machines.length > 0)
   const [, tick] = useState(0)
@@ -143,8 +149,11 @@ export default function MachineTree(): JSX.Element {
     }
     window.addEventListener('focus', onFocus)
     const t = setInterval(() => tick((n) => n + 1), 5000)
-    return () => { window.removeEventListener('focus', onFocus); clearInterval(t) }
-  }, [refresh])
+    // What each agent is doing (hover cards, the dropdown): cheap, but no need to hurry.
+    void refreshAgents(true)
+    const slow = setInterval(() => { if (document.visibilityState === 'visible') void refreshAgents() }, 15_000)
+    return () => { window.removeEventListener('focus', onFocus); clearInterval(t); clearInterval(slow) }
+  }, [refresh, refreshAgents])
 
   // Arrow keys walk the visible rows; ← folds a host (or climbs to it), → unfolds.
   const onKeyDown = (e: React.KeyboardEvent): void => {
@@ -232,7 +241,13 @@ function HostNode({ h, open, onToggle }: { h: TreeHost; open: boolean; onToggle:
 function AgentRow({ a, host }: { a: TreeAgent; host: string }): JSX.Element {
   const reveal = useStore((s) => s.revealSession)
   const adopt = useStore((s) => s.adoptAgent)
+  const beginRename = useStore((s) => s.beginRename)
+  const editing = useStore((s) => !!a.sessionId && s.renaming?.where === 'tree' && s.renaming.sessionId === a.sessionId)
   const [busy, setBusy] = useState(false)
+  // Only a live session can be renamed; a detached one is opened first.
+  const rename = a.name && a.sessionId && a.state !== 'detached'
+    ? (e: React.MouseEvent): void => { e.stopPropagation(); hideAgentCardNow(); beginRename(a.sessionId!, 'tree') }
+    : undefined
   const activate = async (): Promise<void> => {
     if (a.sessionId) return reveal(a.sessionId)
     if (!a.tmux || busy) return
@@ -242,25 +257,50 @@ function AgentRow({ a, host }: { a: TreeAgent; host: string }): JSX.Element {
   const what = a.state === 'detached'
     ? `Running on @${host}, not open in Paper — click to attach in a new tab`
     : a.visible ? 'Click to switch to its tab' : 'Not in any tab — click to open it in a new tab'
+  if (editing && a.sessionId) {
+    return (
+      <div className={`tree-row tree-agent tree-agent-${a.state} tree-agent-editing`} role="treeitem" data-host={host}>
+        <span className={`dot dot-${a.state}`} />
+        <span className="tree-agent-main">
+          <AgentNameEditor where="tree" sessionId={a.sessionId} />
+          <span className="tree-agent-meta mono">{a.title}</span>
+        </span>
+      </div>
+    )
+  }
   return (
     <button
       className={`tree-row tree-agent tree-agent-${a.state} ${a.visible ? '' : 'tree-agent-hidden'}`}
       role="treeitem"
       data-tree-row="agent"
       data-host={host === LOCAL_HOST ? LOCAL_HOST : host}
+      data-agent={a.name}
       onMouseDown={(e) => e.preventDefault()}
       onClick={() => void activate()}
-      title={`${a.title}${a.cwd ? ` — ${a.cwd}` : ''}\n${what}`}
+      onKeyDown={(e) => { if (e.key === 'F2' && rename) { e.preventDefault(); beginRename(a.sessionId!, 'tree') } }}
+      title={`${a.name ? `@${a.name} · ` : ''}${a.title}${a.cwd ? ` — ${a.cwd}` : ''}\n${what}${rename ? '\nDouble-click the name (or F2) to rename' : ''}`}
     >
       <span className={`dot dot-${a.state === 'detached' ? 'detached' : a.state}`} />
-      {a.provider && <span className={`prov-dot prov-${PROV_GLYPH[a.provider]}`} />}
       <span className="tree-agent-main">
-        <span className="tree-agent-title">{a.title}</span>
+        <span className="tree-agent-line">
+          {a.name && (
+            <span className="tree-agent-name" {...agentHover(a.name, 'left', '.sidebar')} onDoubleClick={rename}>
+              <AgentChip name={a.name} card={false} />
+            </span>
+          )}
+          <span className="tree-agent-title">{a.title}</span>
+        </span>
         <span className="tree-agent-meta mono">
+          {a.provider && <span className={`prov-dot prov-${PROV_GLYPH[a.provider]}`} />}
           {basename(a.cwd)}
           {a.activityAt && <span className="tree-agent-when">{ago(a.activityAt)}</span>}
         </span>
       </span>
+      {rename && (
+        <span className="tree-rename" role="button" aria-label={`Rename @${a.name}`} title="Rename (F2)" onClick={rename}>
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 8.5 L2 6.4 L6.6 1.8 L8.2 3.4 L3.6 8 Z" fill="none" stroke="currentColor" strokeWidth="1" strokeLinejoin="round" /></svg>
+        </span>
+      )}
       {busy ? <span className="mini-spin" /> : a.state === 'detached' && <span className="tree-tag">detached</span>}
     </button>
   )

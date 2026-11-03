@@ -10,6 +10,7 @@ import AccountsPanel from './components/AccountsPanel'
 import MachinesPanel from './components/MachinesPanel'
 import MoveMachine from './components/MoveMachine'
 import { AliasChip } from './components/HostTag'
+import { AgentCard, AgentChip, AgentNameSheet } from './components/AgentTag'
 import { LOCAL_HOST } from '@shared/types'
 import {
   FindBar, HandoffOverlay, PaneWidgetSheet, RenameSheet, SteerSheet, Toast, WidgetSheet
@@ -20,6 +21,7 @@ import { shortPath } from './components/Pane'
 import './styles/theme.css'
 import './styles/app.css'
 import './styles/machines.css'
+import './styles/agents.css'
 
 const api = window.paper
 
@@ -57,6 +59,10 @@ export default function App(): JSX.Element {
         case 'session.close': if (s.activeTabId) s.closeTab(s.activeTabId); break
         case 'session.restart': if (session) void api.session.restart(session.id); break
         case 'session.rename': s.setOverlay('rename'); break
+        case 'agent.rename':
+          if (session?.name && session.provider !== 'shell') s.beginRename(session.id, 'sheet')
+          else s.notify('The focused session is not a named agent', 'warn')
+          break
         case 'session.interrupt':
           if (session) { void api.session.interrupt(session.id); s.notify('Interrupted') }
           break
@@ -142,6 +148,14 @@ export default function App(): JSX.Element {
               : 'no session'}
           </span>
           {session && <span className="status-sep">·</span>}
+          {session?.name && session.provider !== 'shell' && (
+            <AgentChip
+              name={session.name}
+              card="right"
+              title="Double-click to rename (⌘⌥R)"
+              onDoubleClick={() => store.beginRename(session.id, 'sheet')}
+            />
+          )}
           {session && session.host && session.host !== LOCAL_HOST && (
             <AliasChip alias={session.host} onClick={() => store.openMachines({ focus: session.host })} title="Machine details (⌘⇧M)" />
           )}
@@ -167,6 +181,8 @@ export default function App(): JSX.Element {
       {store.overlay === 'cwd' && <CwdPalette />}
       {store.overlay === 'machines' && <MachinesPanel />}
       {store.overlay === 'move' && <MoveMachine />}
+      {store.overlay === 'agentName' && <AgentNameSheet />}
+      <AgentCard />
     </div>
   )
 }

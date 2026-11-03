@@ -1,6 +1,7 @@
 /**
  * @-mentions inside an xterm: tracking the token the user is typing (for the
- * autocomplete) and painting registered `@alias`es blue in the viewport.
+ * autocomplete) and painting registered `@alias`es (blue) and agent `@name`s
+ * (violet) in the viewport.
  *
  * Both work from what xterm already has — the keystrokes it is about to send
  * (`onData`) and the cells in its buffer — so nothing here depends on which
@@ -118,15 +119,22 @@ export function locateToken(term: Terminal, query: string): { row: number; col: 
 
 export interface MentionColors { fg: string; bg: string }
 
+/** What an `@word` refers to: a registered machine or a named agent. */
+export type MentionKind = 'machine' | 'agent'
+
 /**
- * Paints `@alias` (registered aliases only, on word boundaries) in the visible
- * rows with xterm decorations, and makes them clickable with a link provider.
+ * Paints `@alias` and `@name` (registered machines and named agents only, on
+ * word boundaries) in the visible rows with xterm decorations, each kind in its
+ * own colour, and makes them clickable with a link provider.
  * Rescans are coalesced to one per ~60 ms however fast output arrives, only
  * touch the viewport, and keep decorations whose match did not move — so a
  * redraw of Claude's input box does not make the tags flicker.
  */
 export class MentionHighlighter {
   private regex: RegExp | null = null
+  /** Mention text → what it names. A machine wins a clash (main never allows one). */
+  private kinds = new Map<string, MentionKind>()
+  private targetsKey = ''
   private live = new Map<string, { marker: IMarker; deco: IDecoration | undefined }>()
   private timer: ReturnType<typeof setTimeout> | null = null
   private subs: IDisposable[] = []
@@ -134,8 +142,8 @@ export class MentionHighlighter {
 
   constructor(
     private term: Terminal,
-    private colors: () => MentionColors,
-    onActivate: (alias: string) => void
+    private colors: (kind: MentionKind) => MentionColors,
+    onActivate: (kind: MentionKind, target: string) => void
   ) {
     const schedule = (): void => this.schedule()
     this.subs.push(term.onWriteParsed(schedule), term.onScroll(schedule), term.onResize(schedule))
@@ -152,7 +160,7 @@ export class MentionHighlighter {
             range: { start: { x: start + 1, y: lineNo }, end: { x: end + 1, y: lineNo } },
             text: m[0],
             decorations: { pointerCursor: true, underline: true },
-            activate: () => onActivate(m[1])
+            activate: () => onActivate(this.kindOf(m[1]), m[1])
           }
         })
         callback(links.length ? links : undefined)
@@ -160,10 +168,19 @@ export class MentionHighlighter {
     }))
   }
 
-  setAliases(aliases: string[]): void {
-    this.regex = mentionRegex(aliases)
+  /** What to paint: machine aliases and agent names. A no-op when nothing changed. */
+  setTargets(aliases: string[], names: string[]): void {
+    const key = `${aliases.join(' ')}|${names.join(' ')}`
+    if (key === this.targetsKey) return
+    this.targetsKey = key
+    this.kinds = new Map<string, MentionKind>()
+    for (const n of names) this.kinds.set(n, 'agent')
+    for (const a of aliases) this.kinds.set(a, 'machine')
+    this.regex = mentionRegex([...this.kinds.keys()])
     this.repaint()
   }
+
+  private kindOf(target: string): MentionKind { return this.kinds.get(target) ?? 'machine' }
 
   /** Colours changed (theme): decorations bake their colour in, so rebuild them. */
   repaint(): void {
@@ -194,15 +211,15 @@ export class MentionHighlighter {
   /**
    * The alternate screen has no markers, so decorations cannot live there —
    * and Claude Code draws its whole UI in it. Instead, lay cell-aligned tags
-   * over the screen: an opaque tinted box per match with the alias re-drawn in
-   * blue, one character per cell so it lines up with the glyphs underneath.
+   * over the screen: an opaque tinted box per match with the mention re-drawn
+   * in its kind's ink, one character per cell so it lines up with the glyphs underneath.
    * pointer-events:none, so clicks fall through to the link provider.
    */
-  private paintAlternate(matches: { row: number; x: number; width: number; text: string }[]): void {
+  private paintAlternate(matches: { row: number; x: number; width: number; text: string; kind: MentionKind }[]): void {
     const term = this.term
     const screen = term.element?.querySelector('.xterm-screen') as HTMLElement | null
     if (!screen) return
-    const keys = matches.map((m) => `${m.row}:${m.x}:${m.width}:${m.text}`).join('|')
+    const keys = matches.map((m) => `${m.row}:${m.x}:${m.width}:${m.text}:${m.kind}`).join('|')
     if (keys === this.overlayKeys && this.overlay?.isConnected) return
     if (!this.overlay || !this.overlay.isConnected) {
       this.overlay = document.createElement('div')
@@ -211,12 +228,13 @@ export class MentionHighlighter {
       screen.appendChild(this.overlay)
     }
     this.overlayKeys = keys
-    const { fg, bg } = this.colors()
     const cellW = screen.clientWidth / term.cols
     const cellH = screen.clientHeight / term.rows
     const font = term.options
     const nodes = matches.map((m) => {
+      const { fg, bg } = this.colors(m.kind)
       const tag = document.createElement('div')
+      tag.dataset.mention = m.kind
       Object.assign(tag.style, {
         position: 'absolute',
         left: `${m.x * cellW}px`,
@@ -251,21 +269,20 @@ export class MentionHighlighter {
       // Decorations need markers, which only the normal buffer has: overlay instead.
       for (const { marker, deco } of this.live.values()) { deco?.dispose(); marker.dispose() }
       this.live.clear()
-      const found: { row: number; x: number; width: number; text: string }[] = []
+      const found: { row: number; x: number; width: number; text: string; kind: MentionKind }[] = []
       for (let row = 0; row < term.rows; row++) {
         const line = buf.getLine(buf.viewportY + row)
         if (!line || !line.translateToString(true).includes('@')) continue
         const { text, colOf } = mapLine(line, term.cols)
         for (const m of text.matchAll(this.regex)) {
           const x = colOf[m.index!]
-          found.push({ row, x, width: colOf[m.index! + m[0].length] - x, text: m[0] })
+          found.push({ row, x, width: colOf[m.index! + m[0].length] - x, text: m[0], kind: this.kindOf(m[1]) })
         }
       }
       this.paintAlternate(found)
       return
     }
     this.clearOverlay()
-    const { fg, bg } = this.colors()
     const seen = new Set<string>()
     for (let row = 0; row < term.rows; row++) {
       const y = buf.viewportY + row
@@ -276,11 +293,13 @@ export class MentionHighlighter {
       for (const m of text.matchAll(this.regex)) {
         const x = colOf[m.index!]
         const width = colOf[m.index! + m[0].length] - x
-        const key = `${y}:${x}:${width}`
+        const kind = this.kindOf(m[1])
+        const key = `${y}:${x}:${width}:${kind}`
         seen.add(key)
         if (this.live.has(key)) continue
         const marker = term.registerMarker(y - (buf.baseY + buf.cursorY))
         if (!marker) continue
+        const { fg, bg } = this.colors(kind)
         const deco = term.registerDecoration({ marker, x, width, foregroundColor: fg, backgroundColor: bg, layer: 'top' })
         this.live.set(key, { marker, deco })
       }
@@ -296,10 +315,10 @@ export class MentionHighlighter {
   }
 
   /** What is painted right now, for tests and ui_eval. */
-  snapshot(): { line: number; x: number; width: number }[] {
+  snapshot(): { line: number; x: number; width: number; kind: string }[] {
     return [...this.live.keys()].map((k) => {
-      const [line, x, width] = k.split(':').map(Number)
-      return { line, x, width }
+      const [line, x, width, kind] = k.split(':')
+      return { line: Number(line), x: Number(x), width: Number(width), kind }
     })
   }
 

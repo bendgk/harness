@@ -140,6 +140,7 @@ export default function MoveMachine(): JSX.Element {
           <span className="label">Continue with (optional)</span>
           <MentionField
             name="move-continue"
+            selfSessionId={session.id}
             value={prompt}
             onChange={setPrompt}
             placeholder="e.g. continue the sweep — typed in once it is running"

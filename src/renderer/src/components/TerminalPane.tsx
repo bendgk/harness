@@ -7,9 +7,10 @@ import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { useStore } from '../state/store'
 import { termTheme } from './term-theme'
-import MentionMenu from './MentionMenu'
-import { MentionHighlighter, MentionTracker, locateToken } from '../lib/term-mentions'
-import { completionKeys, rankMachines } from '../lib/machines'
+import MentionMenu, { menuHeight } from './MentionMenu'
+import { MentionHighlighter, MentionTracker, locateToken, type MentionKind } from '../lib/term-mentions'
+import { completionKeys } from '../lib/machines'
+import { agentSummaries, knownAgentNames, mentionTargets } from '../lib/agents'
 import type { ProviderId } from '@shared/types'
 
 const api = window.paper
@@ -28,17 +29,19 @@ export interface TerminalHandle {
   focus: () => void
 }
 
-/** Decoration colours must be opaque #RRGGBB, so the tag wash is pre-mixed onto each paper. */
-const MENTION_COLORS = {
-  day: { fg: '#2a5fae', bg: '#e1e9f5' },
-  night: { fg: '#9cc3f3', bg: '#1d2836' }
+/**
+ * Decoration colours must be opaque #RRGGBB, so the tag wash is pre-mixed onto
+ * each paper. Machines are fountain-pen blue; agents the violet beside it
+ * (same ink weight and wash depth, so the two read as siblings) — they match
+ * --host / --agent in theme.css.
+ */
+const MENTION_COLORS: Record<'day' | 'night', Record<MentionKind, { fg: string; bg: string }>> = {
+  day: { machine: { fg: '#2a5fae', bg: '#e1e9f5' }, agent: { fg: '#6a48a8', bg: '#ebe5f5' } },
+  night: { machine: { fg: '#9cc3f3', bg: '#1d2836' }, agent: { fg: '#c4b0f2', bg: '#261f36' } }
 }
 
 /** Where the dropdown sits, in pane-body pixels. */
 interface Anchor { left: number; top?: number; bottom?: number; placement: 'above' | 'below' }
-
-const MENU_ROW = 29
-const MENU_CHROME = 52
 
 export default function TerminalPane({ sessionId, focused, provider, register }: Props): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
@@ -49,6 +52,9 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
   const theme = useStore((s) => s.theme)
   const fontSize = useStore((s) => s.fontSize)
   const machines = useStore((s) => s.machines)
+  const nameKey = useStore((s) => knownAgentNames(s).join(' '))
+  // The dropdown re-renders when fresh summaries (what each agent is doing) arrive.
+  useStore((s) => (s.mention?.owner === `term:${sessionId}` ? s.agents : null))
   const owner = `term:${sessionId}`
   const mention = useStore((s) => (s.mention?.owner === owner ? s.mention : null))
   const [anchor, setAnchor] = useState<Anchor | null>(null)
@@ -119,7 +125,7 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
 
     // ---- @-mention autocomplete -------------------------------------------
     // The tracker watches keystrokes on their way to the pty; while it holds a
-    // token that matches a machine, the dropdown is open and the key handler
+    // token that matches an agent or a machine, the dropdown is open and the key handler
     // below claims ↑ ↓ Tab ↩ Esc. Every other key passes straight through.
     const tracker = new MentionTracker()
     const store = useStore.getState
@@ -131,16 +137,19 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       const q = tracker.query
       // Full-screen programs in a plain shell (vim, less) have their own use for @.
       const fullscreen = provider === 'shell' && term.buffer.active.type === 'alternate'
-      const matches = q === null || fullscreen ? [] : rankMachines(q, store().machines).map((m) => m.alias)
+      // This pane's own agent is never offered: mentioning yourself is noise.
+      const { matches, agents } = q === null || fullscreen ? { matches: [], agents: 0 } : mentionTargets(q, store(), sessionId)
       if (!matches.length) {
         if (mine()) store().setMention(null)
         return
       }
       const prev = mine()
+      // Opening the menu is when "what is everyone doing" is worth re-reading.
+      if (!prev) void store().refreshAgents()
       const index = prev && prev.matches[prev.index] ? Math.max(0, matches.indexOf(prev.matches[prev.index])) : 0
       // A bare "@" only advertises: in Claude Code it is also the file picker,
-      // so keys are not taken until the user has typed toward a machine.
-      store().setMention({ owner, query: q!, matches, index, passive: q === '' })
+      // so keys are not taken until the user has typed toward an agent or machine.
+      store().setMention({ owner, query: q!, matches, agents, index, passive: q === '' })
       placeRef.current()
     }
     const close = (boundary: boolean): void => {
@@ -203,13 +212,15 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     const onBlur = (): void => close(false)
     textarea?.addEventListener('blur', onBlur)
 
-    // ---- blue @alias tags ---------------------------------------------------
+    // ---- @alias (blue) and @agent (violet) tags -----------------------------
+    // Clicking a machine opens its details; clicking an agent goes to it,
+    // exactly as the tree does (its tab, a new tab, or adopt then a new tab).
     const highlighter = new MentionHighlighter(
       term,
-      () => MENTION_COLORS[themeRef.current],
-      (alias) => store().openMachines({ focus: alias })
+      (kind) => MENTION_COLORS[themeRef.current][kind],
+      (kind, target) => { if (kind === 'agent') void store().goToAgent(target); else store().openMachines({ focus: target }) }
     )
-    highlighter.setAliases(store().machines.map((m) => m.alias))
+    highlighter.setTargets(store().machines.map((m) => m.alias), knownAgentNames(store()))
     highlightRef.current = highlighter
 
     // Keep the dropdown glued to the token as the program echoes and redraws.
@@ -233,7 +244,9 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       const rowTop = r.top - b.top + row * cellH
       const left = Math.max(6, Math.min(r.left - b.left + col * cellW - 9, b.width - 340))
       // Above the line by default: Claude Code draws its own picker below its input.
-      const need = MENU_CHROME + m.matches.length * MENU_ROW
+      const all = agentSummaries(store())
+      const shownAgents = m.matches.slice(0, m.agents).map((n) => all.find((a) => a.name === n)).filter((a): a is NonNullable<typeof a> => !!a)
+      const need = menuHeight(shownAgents, m.matches.length - m.agents)
       setAnchor(rowTop >= need + 8
         ? { left, bottom: b.height - rowTop + 4, placement: 'above' }
         : { left, top: rowTop + cellH + 4, placement: 'below' })
@@ -287,11 +300,11 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     highlightRef.current?.repaint()
   }, [theme])
 
-  // Registering, renaming or removing a machine changes what gets painted blue.
+  // Registering or removing a machine, or naming/renaming an agent, changes what gets painted.
   const aliasKey = machines.map((m) => m.alias).join(' ')
   useEffect(() => {
-    highlightRef.current?.setAliases(aliasKey ? aliasKey.split(' ') : [])
-  }, [aliasKey])
+    highlightRef.current?.setTargets(aliasKey ? aliasKey.split(' ') : [], nameKey ? nameKey.split(' ') : [])
+  }, [aliasKey, nameKey])
 
   useEffect(() => {
     const term = termRef.current
@@ -315,11 +328,15 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
       if (q) searchRef.current?.[forward ? 'findNext' : 'findPrevious'](q)
     }
     const onClear = (): void => termRef.current?.clear()
+    // An inline editor elsewhere (agent rename in the tree) hands the keyboard back.
+    const onRefocus = (): void => termRef.current?.focus()
     window.addEventListener('paper:find', onFind)
     window.addEventListener('paper:clear', onClear)
+    window.addEventListener('paper:refocus', onRefocus)
     return () => {
       window.removeEventListener('paper:find', onFind)
       window.removeEventListener('paper:clear', onClear)
+      window.removeEventListener('paper:refocus', onRefocus)
     }
   }, [focused])
 
@@ -330,16 +347,21 @@ export default function TerminalPane({ sessionId, focused, provider, register }:
     else setAnchor(null)
   }, [mentionKey])
 
-  const shown = mention && anchor
-    ? mention.matches.map((a) => machines.find((m) => m.alias === a)).filter((m): m is NonNullable<typeof m> => !!m)
+  const all = mention && anchor ? agentSummaries(useStore.getState()) : []
+  const shownAgents = mention && anchor
+    ? mention.matches.slice(0, mention.agents).map((n) => all.find((a) => a.name === n)).filter((a): a is NonNullable<typeof a> => !!a)
+    : []
+  const shownMachines = mention && anchor
+    ? mention.matches.slice(mention.agents).map((a) => machines.find((m) => m.alias === a)).filter((m): m is NonNullable<typeof m> => !!m)
     : []
 
   return (
     <>
       <div className="term-host" ref={hostRef} />
-      {mention && anchor && shown.length > 0 && (
+      {mention && anchor && shownAgents.length + shownMachines.length > 0 && (
         <MentionMenu
-          machines={shown}
+          agents={shownAgents}
+          machines={shownMachines}
           index={mention.index}
           passive={mention.passive}
           placement={anchor.placement}

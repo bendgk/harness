@@ -38,16 +38,18 @@ export default function TabBar(): JSX.Element {
           const provider = meta?.provider
           const remote = meta && meta.host && meta.host !== LOCAL_HOST ? meta : undefined
           const paneCount = leaves(tab.root).length
+          const agentName = meta && meta.provider !== 'shell' ? meta.name : undefined
           return (
             <div
               key={tab.id}
               className={`tab ${active ? 'tab-active' : ''}`}
               onClick={() => selectTab(tab.id)}
               onDoubleClick={() => { selectTab(tab.id); setOverlay('rename') }}
-              title={`${tab.title}${remote ? ` · on @${remote.host}` : ''}${paneCount > 1 ? ` · ${paneCount} panes` : ''}`}
+              title={`${agentName ? `@${agentName} · ` : ''}${tab.title}${remote ? ` · on @${remote.host}` : ''}${paneCount > 1 ? ` · ${paneCount} panes` : ''}`}
             >
               <span className={`dot dot-${statusOf(tab)}`} />
               {provider && <span className={`prov-dot prov-${provider}`} />}
+              {agentName && <span className="agent-chip tab-agent mono">@{agentName}</span>}
               <span className="tab-title">{tab.title}</span>
               {remote && (
                 <span
