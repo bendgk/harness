@@ -18,7 +18,7 @@ import type { UsageTracker } from '../usage'
 import type { TitleService } from '../titles'
 import type { HandoffService } from '../handoff'
 import type { Persisted } from '../store'
-import type { Account, AgentSummary, Machine, MachineInventory, MachineProbe, SessionMeta } from '@shared/types'
+import type { Account, AgentSummary, Machine, MachineInventory, MachineProbe, SessionMeta, PlanUsage } from '@shared/types'
 import type { ExecResult, MachineInput } from '../machines'
 import type { TunnelState } from '../gateway'
 import type { RestoreReport, SessionRegistry } from '../persist'
@@ -69,6 +69,8 @@ export interface ToolContext {
   saveState(patch: Partial<Persisted>): void
   accounts(): Account[]
   /** The on-disk session registry (~/.paper/sessions.json) and the last boot's restore report. */
+  /** Per-account plan usage (plan.ts): what `/usage` shows. */
+  plan(refresh: boolean): Promise<PlanUsage[]>
   persistence: {
     path: string
     read(): SessionRegistry | null

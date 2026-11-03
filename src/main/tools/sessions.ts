@@ -345,5 +345,21 @@ export const sessionTools = [
     group: 'sessions',
     input: { id: z.string().optional().describe('Session id; all sessions when omitted') },
     handler: (args, ctx) => ({ json: args.id ? (ctx.usage.snapshot(args.id) ?? null) : ctx.usage.all() })
+  }),
+
+  defineTool({
+    name: 'plan_usage',
+    title: 'Plan usage per account',
+    description:
+      'What Claude Code\'s /usage shows, for every account: current session, current week (all models) and any ' +
+      'model-scoped week (e.g. Fable), each with percent used and reset time. Claude numbers come from Anthropic\'s ' +
+      'usage endpoint with the account\'s own login; Codex numbers from its transcripts. Cached ~1 min; `refresh` asks again.',
+    group: 'sessions',
+    input: { refresh: z.boolean().default(false).describe('Ask the provider again instead of using the cached numbers') },
+    handler: async (args, ctx) => {
+      const labels = new Map(ctx.accounts().map((a) => [a.id, a.label]))
+      const plans = await ctx.plan(args.refresh)
+      return { json: plans.map((p) => ({ account: labels.get(p.accountId) ?? p.accountId, ...p })) }
+    }
   })
 ]

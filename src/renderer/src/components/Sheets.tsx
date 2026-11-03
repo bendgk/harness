@@ -95,7 +95,7 @@ const WIDGETS: { id: string; name: string; note: string }[] = [
   { id: 'context', name: 'Context gauge', note: 'how full the model window is' },
   { id: 'usage', name: 'Token ledger', note: 'input, output, cache and cost' },
   { id: 'burn', name: 'Burn sparkline', note: 'token rate over the last minute or two' },
-  { id: 'limits', name: 'Plan limits', note: 'subscription windows, when reported' },
+  { id: 'limits', name: 'Plan usage', note: 'session and weekly limits per account, like /usage' },
   { id: 'pet', name: 'Desk pet', note: 'a small creature that mirrors the agent' },
   { id: 'clock', name: 'Clock', note: 'the time, quietly' }
 ]

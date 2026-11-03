@@ -209,6 +209,30 @@ export interface UsageSnapshot {
   burn: number[]
 }
 
+/** One limit window as `/usage` shows it. */
+export interface PlanWindow {
+  /** session = the rolling ~5h window; weekly = all models; weekly_scoped = one model (e.g. Fable). */
+  kind: 'session' | 'weekly' | 'weekly_scoped'
+  /** e.g. "Current session", "Current week (all models)", "Current week (Fable)". */
+  label: string
+  percent: number
+  resetsAt?: number
+  severity?: string
+}
+
+/** An account's plan usage — the numbers behind Claude Code's `/usage`. Percentages only; never credentials. */
+export interface PlanUsage {
+  accountId: string
+  provider: AgentProviderId
+  at: number
+  ok: boolean
+  windows: PlanWindow[]
+  /** Why the numbers are missing or old, in words a person can act on. */
+  error?: string
+  /** The last good numbers are shown, but the latest refresh failed. */
+  stale?: boolean
+}
+
 export interface RateLimitWindow {
   name: string
   usedPercent: number
@@ -382,6 +406,7 @@ export interface MainEvents {
   'handoff:progress': { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }
   'app:command': { command: string }
   'machines:update': Machine[]
+  'plan:update': PlanUsage
   'machines:inventory': MachineInventory
   /** A new main-process app bundle was activated (hot reload). */
   'hot:update': { generation: number; at: number; tools: number }

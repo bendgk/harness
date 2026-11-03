@@ -2,6 +2,7 @@ import { ipcMain, dialog, BrowserWindow, shell } from 'electron'
 import { existsSync } from 'node:fs'
 import { sessionManager } from './sessions'
 import { finalFlush } from './persist'
+import { planUsage, startPlanPoller, type PlanDeps } from './plan'
 import { UsageTracker } from './usage'
 import { HandoffService } from './handoff'
 import { TitleService } from './titles'
@@ -23,6 +24,12 @@ import { LOCAL_HOST, type AgentProviderId, type AppSnapshot, type MachineHandoff
 export const usageTracker = new UsageTracker(sessionManager)
 export const handoff = new HandoffService(sessionManager, usageTracker)
 export const titles = new TitleService(sessionManager)
+
+/** What plan.ts needs from live services: Codex windows come from usage snapshots. */
+export const planDeps: PlanDeps = {
+  snapshots: () => usageTracker.all(),
+  accountOf: (sessionId) => sessionManager.meta(sessionId)?.accountId
+}
 
 function broadcast(channel: string, payload: unknown): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -50,6 +57,7 @@ export function wireEvents(): () => void {
   // Before the first tick, so a drifted session never reads the wrong file again.
   usageTracker.reconcile()
   usageTracker.start()
+  const stopPlan = startPlanPoller(planDeps)
   titles.start()
   const stopInventory = startInventory()
   const detachGateway = startGateway()
@@ -59,6 +67,7 @@ export function wireEvents(): () => void {
     machineEvents.off('update', onMachines)
     machineEvents.off('inventory', onInventory)
     usageTracker.stop()
+    stopPlan()
     titles.stop()
     usageTracker.removeAllListeners()
     handoff.removeAllListeners()
@@ -212,6 +221,7 @@ export function registerIpc(): () => void {
   // ---- usage & handoff ----------------------------------------------------
   handle('usage:get', (id: string) => usageTracker.snapshot(id))
   handle('usage:all', () => usageTracker.all())
+  handle('plan:list', (refresh?: boolean) => planUsage(planDeps, { refresh: Boolean(refresh) }))
   handle('handoff:switch', (sessionId: string, accountId: string) => handoff.switchAccount(sessionId, accountId))
   handle('handoff:machine', (req: MachineHandoffRequest) => handoff.toMachine(req))
   handle('machines:adopt', (alias: string, tmux: string) => sessionManager.adoptRemote(alias, tmux))

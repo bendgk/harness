@@ -344,6 +344,16 @@
 .limit-name { color: var(--ink-faint); }
 .limit-val { color: var(--ink-soft); }
 .limit-reset { font-size: 9.5px; color: var(--ink-ghost); }
+.limit .meter { margin: 3px 0 2px; }
+.plan-error { font-size: 10px; line-height: 1.4; color: var(--ink-faint); margin: 2px 0 6px; }
+.plan-refresh {
+  all: unset;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+.plan-refresh:hover { color: var(--ink-soft); }
+.plan-refresh.busy { opacity: 0.5; cursor: progress; }
 
 .clock {
   font-size: 10.5px;

@@ -1,7 +1,8 @@
 /** Binds the pure tool registry to the live services of this app generation. */
 import { kernel } from '../kernel'
 import { sessionManager } from '../sessions'
-import { usageTracker, handoff, titles } from '../ipc'
+import { usageTracker, handoff, titles, planDeps } from '../ipc'
+import { planUsage } from '../plan'
 import { sendCommand } from '../menu'
 import { getState, saveState } from '../store'
 import { describeAccount, listAccounts } from '../accounts'
@@ -36,6 +37,7 @@ export function createToolContext(): ToolContext {
     getState,
     saveState,
     accounts: () => listAccounts().map((a) => ({ ...a, plan: describeAccount(a) ?? a.plan })),
+    plan: (refresh) => planUsage(planDeps, { refresh }),
     persistence: { path: SESSIONS_FILE, read: readRegistry, report: restoreReport },
     window: () => kernel().window(),
     command: sendCommand,

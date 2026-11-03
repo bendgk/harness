@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import {
   LOCAL_HOST,
   type Account, type AgentSummary, type DropZone, type Machine, type MachineError, type MachineHandoffRequest, type MachineInventory, type PaneContent,
-  type PaneNode, type ProviderId, type SessionMeta, type SpawnRequest, type Tab, type UsageSnapshot, type WidgetPrefs
+  type PaneNode, type PlanUsage, type ProviderId, type SessionMeta, type SpawnRequest, type Tab, type UsageSnapshot, type WidgetPrefs
 } from '@shared/types'
 import { fake, fakesOn, decorate } from '../lib/dev-fakes'
 import { cleanIpcError } from '../lib/machines'
@@ -92,6 +92,9 @@ interface State {
   activeTabId: string | null
   sessions: Record<string, SessionMeta>
   usage: Record<string, UsageSnapshot>
+  /** Plan limits per account id — what `/usage` shows (main/plan.ts). */
+  plan: Record<string, PlanUsage>
+  refreshPlan: () => Promise<void>
   accounts: Account[]
   defaults: { provider: ProviderId; cwd: string; accountByProvider: Partial<Record<ProviderId, string>> }
   widgets: WidgetPrefs
@@ -223,6 +226,14 @@ export const useStore = create<State>((set, get) => ({
   activeTabId: null,
   sessions: {},
   usage: {},
+  plan: {},
+
+  async refreshPlan() {
+    try {
+      const list = await api.usage.plan(true)
+      set({ plan: Object.fromEntries(list.map((p) => [p.accountId, p])) })
+    } catch { /* main not ready (hot swap) — the next push fills it */ }
+  },
   accounts: [],
   defaults: { provider: 'claude', cwd: '~', accountByProvider: {} },
   widgets: { enabled: ['usage', 'context', 'limits', 'burn', 'pet', 'clock'], petName: 'Inky' },
@@ -285,6 +296,7 @@ export const useStore = create<State>((set, get) => ({
       bind()
       syncTabTitles()
       void get().refreshAgents(true)
+      void api.usage.plan().then((list) => set({ plan: Object.fromEntries(list.map((p) => [p.accountId, p])) })).catch(() => undefined)
       if (!tabs.length) await get().newTab()
     })()
     return booting
@@ -961,6 +973,7 @@ function bind(): void {
       set((s) => ({ lastActivity: { ...s.lastActivity, [sessionId]: now } }))
     }),
     api.onUsage((u) => set((s) => ({ usage: { ...s.usage, [u.sessionId]: u } }))),
+    api.onPlan((p) => set((s) => ({ plan: { ...s.plan, [p.accountId]: p } }))),
     api.onAccounts((accounts) => set({ accounts })),
     api.onHandoff(onHandoff),
     api.onPtyExit(({ sessionId }) => {

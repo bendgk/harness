@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
-  Account, AgentProviderId, AgentSummary, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, MachineInventory, MachineProbe, SessionMeta,
+  Account, AgentProviderId, AgentSummary, AppSnapshot, DirComplete, Machine, MachineHandoffRequest, PlanUsage, MachineInventory, MachineProbe, SessionMeta,
   SpawnRequest, Tab, ToolManifestEntry, ToolResult, UsageSnapshot, WidgetPrefs
 } from '@shared/types'
 
@@ -63,6 +63,8 @@ const api = {
   },
 
   usage: {
+    /** Per-account plan limits — the numbers behind `/usage`. `refresh` asks the provider again. */
+    plan: (refresh?: boolean) => invoke<PlanUsage[]>('plan:list', refresh ?? false),
     get: (id: string) => invoke<UsageSnapshot | undefined>('usage:get', id),
     all: () => invoke<UsageSnapshot[]>('usage:all')
   },
@@ -106,6 +108,7 @@ const api = {
   onSessionClosed: (fn: (p: { sessionId: string }) => void) => on('session:closed', fn),
   onSession: (fn: (m: SessionMeta) => void) => on('session:update', fn),
   onUsage: (fn: (u: UsageSnapshot) => void) => on('usage:update', fn),
+  onPlan: (fn: (p: PlanUsage) => void) => on('plan:update', fn),
   onAccounts: (fn: (a: Account[]) => void) => on('accounts:update', fn),
   onHandoff: (fn: (p: { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }) => void) =>
     on('handoff:progress', fn),
