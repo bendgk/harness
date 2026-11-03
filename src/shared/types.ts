@@ -1,0 +1,195 @@
+/** Shared contract between the main process and the renderer. */
+
+/** `shell` is a plain login shell — no account, no transcript, no usage. */
+export type ProviderId = 'claude' | 'codex' | 'shell'
+export type AgentProviderId = 'claude' | 'codex'
+
+/** A configured login. Each account owns an isolated CLI config home. */
+export interface Account {
+  id: string
+  provider: AgentProviderId
+  /** Human label, e.g. "work" or "personal". */
+  label: string
+  /** Absolute path to the isolated CLAUDE_CONFIG_DIR / CODEX_HOME. */
+  home: string
+  /** Free-form note, e.g. plan tier. */
+  plan?: string
+  /** Colour accent used in the UI (hex). */
+  color?: string
+  /** Last time we saw a live credential in this home. */
+  lastAuthAt?: number
+  /** Whether a credential file currently exists in the home. */
+  authed?: boolean
+  createdAt: number
+}
+
+export type SessionStatus =
+  | 'starting'
+  | 'idle'       // process alive, agent waiting for input
+  | 'working'    // agent is producing output
+  | 'exited'
+  | 'handoff'    // mid account-switch
+
+export interface SessionMeta {
+  id: string
+  title: string
+  /** True once a model-generated title has replaced the placeholder. */
+  titleIsAi: boolean
+  provider: ProviderId
+  accountId: string
+  cwd: string
+  status: SessionStatus
+  /** Provider-native conversation id, used for resume/handoff. */
+  nativeSessionId?: string
+  /** Path of the transcript we are tailing for usage. */
+  transcriptPath?: string
+  createdAt: number
+  /** Accounts this session has previously run under, oldest first. */
+  lineage: { accountId: string; at: number; nativeSessionId?: string }[]
+  exitCode?: number
+}
+
+export interface UsageSnapshot {
+  sessionId: string
+  provider: ProviderId
+  model?: string
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  /** Estimated spend in USD for this session (API-equivalent pricing). */
+  costUsd: number
+  /** Tokens currently resident in the model's context window. */
+  contextTokens: number
+  contextWindow: number
+  messages: number
+  /** Provider-reported subscription limits, when available. */
+  limits?: RateLimitWindow[]
+  /** Credit balance, when the provider reports one. */
+  credits?: { balance: number; unlimited: boolean }
+  updatedAt: number
+  /** Rolling per-minute token burn, newest last. */
+  burn: number[]
+}
+
+export interface RateLimitWindow {
+  name: string
+  usedPercent: number
+  windowMinutes: number
+  resetsAt?: number
+}
+
+/** What a pane is showing. A pane is a slot, not necessarily a terminal. */
+export type PaneContent =
+  | {
+      type: 'terminal'
+      sessionId: string | null
+      /** Directory a not-yet-started pane will open in. */
+      cwd?: string
+    }
+  | { type: 'widget'; widget: string; props?: Record<string, unknown> }
+
+export type PaneNode =
+  | {
+      kind: 'leaf'
+      id: string
+      content: PaneContent
+      /** Legacy field from before panes could hold widgets; migrated on load. */
+      sessionId?: string | null
+    }
+  | { kind: 'split'; id: string; dir: 'row' | 'col'; sizes: number[]; children: PaneNode[] }
+
+/** Where a dragged pane lands relative to the pane it is dropped on. */
+export type DropZone = 'left' | 'right' | 'top' | 'bottom' | 'center'
+
+export interface Tab {
+  id: string
+  /** Mirrors the focused session's title; user can pin an override. */
+  title: string
+  titleOverride?: string
+  root: PaneNode
+  focusedPaneId: string
+  createdAt: number
+}
+
+export interface AppSnapshot {
+  tabs: Tab[]
+  activeTabId: string | null
+  sessions: SessionMeta[]
+  accounts: Account[]
+  defaults: {
+    provider: ProviderId
+    cwd: string
+    accountByProvider: Partial<Record<AgentProviderId, string>>
+  }
+  widgets: WidgetPrefs
+  /** Directories opened recently, most recent first. */
+  recentDirs: string[]
+}
+
+/** One completion candidate for the directory bar. */
+export interface DirEntry {
+  name: string
+  path: string
+  /** Whether the directory is the root of a git repository. */
+  repo?: boolean
+}
+
+export interface DirComplete {
+  /** The directory being listed. */
+  base: string
+  entries: DirEntry[]
+  /** Longest prefix shared by all matches, for tab completion. */
+  common: string
+  /** Whether the typed path itself resolves to a directory. */
+  exact: boolean
+  resolved: string
+}
+
+export interface WidgetPrefs {
+  enabled: string[]
+  petName: string
+}
+
+export interface SpawnRequest {
+  provider: ProviderId
+  accountId?: string
+  cwd?: string
+  /** Resume an existing provider-native conversation. */
+  resume?: string
+  /** Initial prompt typed into the agent once it boots. */
+  prompt?: string
+}
+
+/** One entry of the tool registry, as exposed to the UI and to `tools_list`. */
+export interface ToolManifestEntry {
+  name: string
+  title: string
+  description: string
+  group: string
+  mutates: boolean
+  inputSchema: unknown
+}
+
+/** What a tool returns. `json` is structured data, `text` is prose, `image` is base64. */
+export interface ToolResult {
+  text?: string
+  json?: unknown
+  image?: { data: string; mimeType: string }
+  isError?: boolean
+}
+
+/** Events pushed from main → renderer. */
+export interface MainEvents {
+  'pty:data': { sessionId: string; data: string }
+  'pty:exit': { sessionId: string; exitCode: number }
+  'session:update': SessionMeta
+  'usage:update': UsageSnapshot
+  'accounts:update': Account[]
+  'handoff:progress': { sessionId: string; stage: string; detail?: string; done?: boolean; error?: string }
+  'app:command': { command: string }
+  /** A new main-process app bundle was activated (hot reload). */
+  'hot:update': { generation: number; at: number; tools: number }
+}

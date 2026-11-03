@@ -1,0 +1,60 @@
+{
+  "name": "paper",
+  "version": "0.1.0",
+  "description": "A paper-matte terminal harness for Claude Code and Codex",
+  "main": "./out/main/index.js",
+  "author": "kosten",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "build": "electron-vite build",
+    "postinstall": "electron-rebuild -f -w node-pty",
+    "rebuild": "electron-rebuild -f -w node-pty",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "dist": "electron-vite build && electron-builder --mac --dir",
+    "dev:isolated": "PAPER_HOME=$HOME/.paper-dev PAPER_USER_DATA=$HOME/.paper-dev/userData PAPER_MCP_PORT=47820 PAPER_DEV_PORT=5183 electron-vite dev",
+    "tools:sync": "node scripts/sync-tools.mjs",
+    "tools:check": "node scripts/sync-tools.mjs --check",
+    "check": "npm run typecheck && npm run tools:check"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "node-pty": "^1.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.1",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-unicode11": "^0.8.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/addon-webgl": "^0.18.0",
+    "@xterm/xterm": "^5.5.0",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "zustand": "^5.0.2",
+    "esbuild": "^0.21.5"
+  },
+  "build": {
+    "appId": "dev.gambit.paper",
+    "productName": "Paper",
+    "files": [
+      "out/**/*",
+      "resources/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": "dir"
+    }
+  }
+}
