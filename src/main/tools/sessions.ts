@@ -46,7 +46,8 @@ export const sessionTools = [
     title: 'List sessions',
     description:
       'Every live session (agent or shell) with id, provider, account, cwd, status (starting/working/idle/exited/handoff), ' +
-      'title and usage totals. Session ids are what every other session_* tool takes.',
+      'title and usage totals. `restoredAt` is set on sessions brought back after Paper restarted. ' +
+      'Session ids are what every other session_* tool takes.',
     group: 'sessions',
     input: {},
     handler: (_args, ctx) => ({
@@ -58,6 +59,21 @@ export const sessionTools = [
           alive: Boolean(ctx.sessions.get(m.id)?.proc)
         }
       })
+    })
+  }),
+
+  defineTool({
+    name: 'sessions_persisted',
+    title: 'Persisted sessions',
+    description:
+      'The on-disk session registry (~/.paper/sessions.json) that brings sessions back after Paper restarts: one record per ' +
+      'session with its full meta, wasWorking (mid-turn at the last write), lastActiveAt and terminal size, plus quitAt when ' +
+      'the last run quit cleanly. `restore` is what this boot did with each record (resumed/fresh/reattached/shell/exited/failed, ' +
+      'whether a continuation nudge was sent) and any orphaned CLI processes it terminated. Holds no secrets.',
+    group: 'sessions',
+    input: {},
+    handler: (_args, ctx) => ({
+      json: { path: ctx.persistence.path, registry: ctx.persistence.read(), restore: ctx.persistence.report() }
     })
   }),
 

@@ -11,6 +11,7 @@ import { BrowserWindow } from 'electron'
 import { kernel, type HotModule } from './kernel'
 import { registerIpc, wireEvents, shutdown } from './ipc'
 import { sessionManager } from './sessions'
+import { restoreOnce, wirePersistence } from './persist'
 import { buildMenu, sendCommand } from './menu'
 import { ensureDirs } from './paths'
 import { loadState, flush } from './store'
@@ -30,6 +31,12 @@ export function activate(): HotModule {
   setToolContext(createToolContext())
   const unregisterIpc = registerIpc()
   const unwireEvents = wireEvents()
+  const unwirePersistence = wirePersistence()
+  // Cold start only (a kernel-slot flag makes later generations skip it): bring
+  // back the sessions the last run left in ~/.paper/sessions.json. The kernel
+  // activates before it creates the window, so the renderer's first snapshot
+  // already contains them under their old ids.
+  restoreOnce()
   buildMenu(sendCommand)
   const handleHttp = createMcpHandler()
 
@@ -44,6 +51,7 @@ export function activate(): HotModule {
     dispose() {
       unregisterIpc()
       unwireEvents()
+      unwirePersistence()
       setToolContext(null)
       sessionManager.detach()
       flush()

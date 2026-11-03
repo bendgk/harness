@@ -9,6 +9,7 @@ import {
   addMachine, execOnMachine, inventory, listMachines, probeMachine, removeMachine, suggestMachines, updateMachine
 } from '../machines'
 import { gatewayStatus } from '../gateway'
+import { SESSIONS_FILE, readRegistry, restoreReport } from '../persist'
 import { invokeTool } from './runtime'
 import type { ToolContext } from './types'
 
@@ -33,6 +34,7 @@ export function createToolContext(): ToolContext {
     getState,
     saveState,
     accounts: () => listAccounts().map((a) => ({ ...a, plan: describeAccount(a) ?? a.plan })),
+    persistence: { path: SESSIONS_FILE, read: readRegistry, report: restoreReport },
     window: () => kernel().window(),
     command: sendCommand,
     evalInRenderer,

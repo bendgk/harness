@@ -21,6 +21,7 @@ import type { Persisted } from '../store'
 import type { Account, Machine, MachineInventory, MachineProbe } from '@shared/types'
 import type { ExecResult, MachineInput } from '../machines'
 import type { TunnelState } from '../gateway'
+import type { RestoreReport, SessionRegistry } from '../persist'
 
 export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state' | 'machines'
 
@@ -58,6 +59,12 @@ export interface ToolContext {
   getState(): Persisted
   saveState(patch: Partial<Persisted>): void
   accounts(): Account[]
+  /** The on-disk session registry (~/.paper/sessions.json) and the last boot's restore report. */
+  persistence: {
+    path: string
+    read(): SessionRegistry | null
+    report(): RestoreReport | null
+  }
   window(): BrowserWindow | null
   /** Run a menu command in the renderer, exactly as the keystroke would. */
   command(name: string): void
