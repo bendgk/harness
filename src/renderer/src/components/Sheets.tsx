@@ -2,6 +2,10 @@ import { useState } from 'react'
 import Modal from './Modal'
 import { useStore } from '../state/store'
 import { PANE_WIDGETS } from '../widgets/panes'
+import MentionField from './MentionField'
+import { AliasChip } from './HostTag'
+import { splitHint } from '../lib/machines'
+import { LOCAL_HOST } from '@shared/types'
 
 const api = window.paper
 
@@ -30,13 +34,15 @@ export function SteerSheet(): JSX.Element {
       subtitle={session?.title}
       onClose={close}
     >
-      <textarea
-        className="steer-input mono"
-        placeholder="Tell the agent what to do instead…"
+      <MentionField
+        name="steer"
+        variant="steer"
+        multiline
+        rows={4}
+        placeholder="Tell the agent what to do instead… (@ to mention a machine)"
         value={text}
         autoFocus
-        rows={4}
-        onChange={(e) => setText(e.target.value)}
+        onChange={setText}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
         }}
@@ -196,14 +202,56 @@ export function PaneWidgetSheet(): JSX.Element {
   )
 }
 
-/** A quiet progress line while a session moves between accounts. */
+/**
+ * A quiet progress line while a session moves between accounts or machines.
+ * A failed machine move turns into a card that stays until dismissed, with
+ * the hint — what the human has to do — set apart from the error itself.
+ * When the agent moved itself, it says so, so the overlay is not a surprise.
+ */
 export function HandoffOverlay(): JSX.Element | null {
   const handoff = useStore((s) => s.handoff)
+  const title = useStore((s) => (s.handoff ? s.sessions[s.handoff.sessionId]?.title : undefined))
+  const dismiss = useStore((s) => s.dismissHandoff)
+  const openMachines = useStore((s) => s.openMachines)
   if (!handoff) return null
+  const target = handoff.target
+  const where = target === LOCAL_HOST
+    ? <span>this Mac</span>
+    : target ? <AliasChip alias={target} /> : null
+
+  if (handoff.error) {
+    const { message, hint } = splitHint(handoff.error)
+    return (
+      <div className="handoff handoff-error fade-in" role="alert">
+        <div className="handoff-err-main">
+          <span className="handoff-err-title">
+            Could not move {title ? <b>{title}</b> : 'the session'}{where && <> to {where}</>}
+          </span>
+          <span className="handoff-err-msg">{message}</span>
+          {hint && <span className="handoff-hint">{hint}</span>}
+          <span className="handoff-err-note">The session is unchanged and still running where it was.</span>
+        </div>
+        <div className="handoff-err-actions">
+          {target && target !== LOCAL_HOST && (
+            <button className="ghost-btn tiny" onClick={() => { dismiss(); openMachines({ focus: target }) }}>machine</button>
+          )}
+          <button className="ghost-btn tiny" onClick={dismiss}>dismiss</button>
+        </div>
+      </div>
+    )
+  }
+
+  const byAgent = handoff.initiator === 'agent'
   return (
-    <div className="handoff fade-in">
+    <div className={`handoff fade-in ${byAgent ? 'handoff-agent' : ''}`}>
       <span className="handoff-spinner" />
-      <span className="handoff-stage">{handoff.stage}</span>
+      {byAgent && (
+        <>
+          <span className="handoff-who">{title ?? 'The agent'} is moving itself{where && <> to {where}</>}</span>
+          <span className="status-sep">·</span>
+        </>
+      )}
+      <span className={byAgent ? 'handoff-detail' : 'handoff-stage'}>{handoff.stage}</span>
       {handoff.detail && <span className="handoff-detail mono">{handoff.detail}</span>}
     </div>
   )

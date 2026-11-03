@@ -7,7 +7,8 @@ const STORE = 'window.__paper.store.getState()'
 const MENU_COMMANDS = [
   'session.new', 'session.new.claude', 'session.new.codex', 'session.new.shell', 'session.newInFolder',
   'session.cd', 'session.close', 'session.restart', 'session.rename', 'session.interrupt', 'session.steer',
-  'session.find', 'session.clear', 'account.switch', 'accounts.open', 'palette.open',
+  'session.find', 'session.clear', 'session.moveMachine', 'account.switch', 'accounts.open', 'machines.open',
+  'palette.open',
   'pane.split.row', 'pane.split.col', 'pane.close', 'pane.contents', 'pane.next', 'pane.prev',
   'tab.next', 'tab.prev', 'tab.select.0', 'sidebar.toggle', 'widgets.toggle', 'zen.toggle',
   'font.bigger', 'font.smaller'
