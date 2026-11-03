@@ -28,13 +28,21 @@ import { SYSTEM_CLAUDE_HOME } from './paths'
 import type { Account, PlanUsage, PlanWindow, UsageSnapshot } from '@shared/types'
 
 const ENDPOINT = 'https://api.anthropic.com/api/oauth/usage'
-const FOCUSED_MS = 60_000
-const BACKGROUND_MS = 5 * 60_000
+/**
+ * The usage endpoint is rate-limited per login and answered 429 at one call a
+ * minute per account. Plan numbers move slowly; every few minutes is plenty.
+ */
+const FOCUSED_MS = 3 * 60_000
+const BACKGROUND_MS = 15 * 60_000
+const BACKOFF_MIN_MS = 5 * 60_000
+const BACKOFF_MAX_MS = 30 * 60_000
 
 interface PlanSlot {
   byAccount: Map<string, PlanUsage>
   /** Earliest time each account may be asked again (429 / failures back off). */
   notBefore: Map<string, number>
+  /** Consecutive 429s per account, for exponential back-off. */
+  strikes?: Map<string, number>
 }
 
 function slot(): PlanSlot {
@@ -140,10 +148,19 @@ async function fetchClaude(account: Account): Promise<PlanUsage> {
   if (res.status === 401 || res.status === 403) {
     return { ...base, ok: false, windows: [], error: 'Anthropic rejected this login. Sign in again from Accounts (⌘,).' }
   }
+  const s = slot()
+  s.strikes ??= new Map()
   if (res.status === 429) {
-    slot().notBefore.set(account.id, Date.now() + 5 * 60_000)
-    return { ...base, ok: false, windows: [], error: 'Rate-limited by Anthropic; trying again in a few minutes.' }
+    // Honour Retry-After (seconds or an HTTP date); otherwise back off 5 → 10 → 20 → 30 min.
+    const ra = res.headers.get('retry-after')
+    const raMs = ra ? (/^\d+$/.test(ra) ? Number(ra) * 1000 : Date.parse(ra) - Date.now()) : NaN
+    const strikes = (s.strikes.get(account.id) ?? 0) + 1
+    s.strikes.set(account.id, strikes)
+    const wait = Math.min(BACKOFF_MAX_MS, Math.max(Number.isFinite(raMs) ? raMs : 0, BACKOFF_MIN_MS * 2 ** (strikes - 1)))
+    s.notBefore.set(account.id, Date.now() + wait)
+    return { ...base, ok: false, windows: [], error: `Anthropic is rate-limiting usage checks; next try in ${Math.ceil(wait / 60_000)} min.` }
   }
+  s.strikes.delete(account.id)
   if (!res.ok) return { ...base, ok: false, windows: [], error: `Anthropic returned ${res.status}.` }
   let body: unknown
   try { body = await res.json() } catch { return { ...base, ok: false, windows: [], error: 'Unreadable response from Anthropic.' } }

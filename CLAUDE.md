@@ -1203,8 +1203,9 @@ Codex accounts use the windows their own transcripts report (from the usage snap
   renderer, or sent anywhere but Anthropic. Only percentages, reset times and labels leave the module.
 - **Never refresh.** A refresh rotates the refresh token and would sign the running Claude Code out. An expired
   token is reported ("use this account in a session and it renews itself").
-- **Cadence.** Polled every 60 s while a window is focused, 5 min otherwise; a 429 backs that account off 5 min; a
-  transient failure keeps the last good numbers with `stale: true`. Cached in a kernel slot across hot swaps.
+- **Cadence.** Polled every 3 min while a window is focused, 15 min otherwise — the endpoint is rate-limited per
+  login and answered 429 at one call a minute. A 429 backs that account off by `Retry-After`, else 5 → 10 → 20 →
+  30 min; a transient failure keeps the last good numbers with `stale: true`. Cached in a kernel slot across hot swaps.
 - **Surfaces.** IPC `plan:list` (`refresh` arg) + push `plan:update`; preload `usage.plan()` / `onPlan`; store
   `plan` keyed by account id; tool `plan_usage`. The sidebar widget id is still `limits` (so existing prefs keep
   it on), shown as **Plan usage**: the focused session's account leads (default Claude account when a terminal is
