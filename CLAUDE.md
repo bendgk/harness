@@ -847,8 +847,14 @@ be moved between machines with its conversation intact. The renderer side:
 - **Blue tags.** `MentionHighlighter` paints registered `@alias`es (word boundary: not after a word char, so
   `ben@g6e` is left alone; a trailing `.` is punctuation) with xterm decorations (`registerMarker` +
   `registerDecoration`, opaque `#RRGGBB` per theme) over the **viewport only**, rescanning at most every 60 ms after
-  writes/scroll/resize, keeping unchanged decorations so redraws do not flicker. Decorations exist only on the
-  normal buffer; a link provider (all buffers) makes the tags clickable → Machines panel focused on that alias.
+  writes/scroll/resize, keeping unchanged decorations so redraws do not flicker. Decorations need markers, which
+  exist only on the normal buffer — and **Claude Code (2.1.x) draws its whole UI on the alternate screen** — so
+  there the highlighter lays a `.paper-mention-overlay` of cell-aligned tags (tinted box, alias re-drawn one char
+  per cell) over `.xterm-screen` instead, `pointer-events: none`. A link provider (all buffers) makes the tags
+  clickable → Machines panel focused on that alias. Remote Claude panes are on the normal buffer (tmux runs with
+  `smcup@:rmcup@`), so they get real decorations.
+- **Closed sessions.** main broadcasts `session:closed` whenever a session is forgotten (UI close, `session_close`,
+  an agent, handoff cleanup); the store drops it and unbinds its panes, so the tree and tabs never show ghosts.
 - **Paper's inputs** (`components/MentionField.tsx`): steer (⌘↩) and "continue with". A transparent-ink
   textarea/input over a mirror that paints the text with `.mention-hl` tags (box-shadow, never padding, so glyphs
   stay aligned); same dropdown, portalled to `body`. `Modal` ignores Esc while the target is inside
