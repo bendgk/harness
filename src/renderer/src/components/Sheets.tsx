@@ -39,7 +39,8 @@ export function SteerSheet(): JSX.Element {
         variant="steer"
         multiline
         rows={4}
-        placeholder="Tell the agent what to do instead… (@ to mention a machine)"
+        placeholder="Tell the agent what to do instead… (@ to mention an agent or machine)"
+        selfSessionId={session?.id}
         value={text}
         autoFocus
         onChange={setText}

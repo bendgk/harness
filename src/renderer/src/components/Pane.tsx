@@ -8,6 +8,7 @@ import { leaves } from '../state/tree'
 import { LOCAL_HOST } from '@shared/types'
 import HostTag, { AliasChip, RestoredHint } from './HostTag'
 import HostPicker from './HostPicker'
+import { AgentChip } from './AgentTag'
 import { canLaunch } from '../lib/machines'
 
 const PROVIDER_NAME: Record<ProviderId, string> = {
@@ -205,6 +206,7 @@ export default function Pane({ paneId, content, focused }: Props): JSX.Element {
   const setWidgetProps = useStore((s) => s.setWidgetProps)
   const agentStatus = useStore((s) => s.activeSession()?.status ?? 'none')
   const openMachines = useStore((s) => s.openMachines)
+  const beginRename = useStore((s) => s.beginRename)
 
   const handle = useRef<TerminalHandle | null>(null)
   const register = useCallback((h: TerminalHandle | null) => { handle.current = h }, [])
@@ -242,6 +244,14 @@ export default function Pane({ paneId, content, focused }: Props): JSX.Element {
       >
         <span className="grip" aria-hidden="true">⠿</span>
         {meta ? <StatusDot meta={meta} /> : <span className="dot dot-idle" title="No session" />}
+        {meta?.name && meta.provider !== 'shell' && (
+          <AgentChip
+            name={meta.name}
+            card="below"
+            title={`@${meta.name} — mention it from any session; double-click to rename`}
+            onDoubleClick={(e) => { e.stopPropagation(); focusPane(paneId); beginRename(meta.id, 'sheet') }}
+          />
+        )}
         <span className="pane-title">{title}</span>
 
         {meta && (

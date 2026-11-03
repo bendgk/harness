@@ -4,6 +4,7 @@ import { useStore } from '../state/store'
 import { PANE_WIDGETS } from '../widgets/panes'
 import { LOCAL_HOST } from '@shared/types'
 import { canLaunch } from '../lib/machines'
+import { agentSummaries, rankAgents } from '../lib/agents'
 
 interface Command {
   id: string
@@ -78,6 +79,10 @@ export default function CommandPalette(): JSX.Element {
           run: () => window.paper.session.restart(session.id) },
         { id: 'rename', group: 'Agent', label: 'Rename session…', hint: '⌘⇧R',
           run: () => store.setOverlay('rename') },
+        ...(session.name && session.provider !== 'shell'
+          ? [{ id: 'agent.rename', group: 'Agent', label: `Rename agent @${session.name}…`, hint: '⌘⌥R',
+              run: () => store.beginRename(session.id, 'sheet') }]
+          : []),
         { id: 'move', group: 'Agent', label: 'Move to machine…', hint: '⌘⇧P',
           run: () => store.setOverlay('move') }
       )
@@ -85,6 +90,18 @@ export default function CommandPalette(): JSX.Element {
         list.push({ id: 'move.local', group: 'Agent', label: 'Move back to this Mac', hint: `from @${session.host}`,
           run: () => store.moveToMachine({ host: LOCAL_HOST }) })
       }
+    }
+
+    // Every other agent, by callsign: its tab, a new tab, or adopted from its machine.
+    for (const a of rankAgents('', agentSummaries(store), session?.id)) {
+      const where = a.host && a.host !== LOCAL_HOST ? ` · @${a.host}` : ''
+      list.push({
+        id: `agent.goto.${a.name}`,
+        group: 'Agents',
+        label: `Go to @${a.name}`,
+        hint: `${a.title}${where}${a.status === 'detached' ? ' · detached' : a.status === 'working' ? ' · working' : ''}`,
+        run: () => store.goToAgent(a.name)
+      })
     }
 
     // Every machine gets its own launchers, and a direct move for the focused session.

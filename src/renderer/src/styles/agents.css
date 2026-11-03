@@ -1,0 +1,162 @@
+/* ============================================================== agents === */
+/* The @name tag: violet ink on a pale violet wash — the agent sibling of the
+   blue @alias. Same box, so the two sit side by side without a seam. */
+.agent-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--agent);
+  background: var(--agent-wash);
+  border-radius: 4px;
+  padding: 0 5px;
+  white-space: nowrap;
+  flex: none;
+  letter-spacing: 0.01em;
+  cursor: default;
+}
+.agent-chip.alias-click { cursor: pointer; }
+.agent-chip.alias-click:hover { box-shadow: 0 0 0 1px var(--agent-rule); }
+.pane-head .agent-chip { font-size: 10px; }
+.statusbar .agent-chip { font-size: 9.5px; line-height: 1.45; }
+.tab-agent { font-size: 9.5px; line-height: 1.4; padding: 0 4px; opacity: 0.85; }
+.tab-active .tab-agent { opacity: 1; }
+.mention-hl-agent { color: var(--agent); background: var(--agent-wash); box-shadow: 0 0 0 1.5px var(--agent-wash); }
+
+/* Dropdown: agent rows carry a second, fainter line with what they are doing. */
+.mention-tall { height: 41px; }
+.mention-main { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 1px; }
+.mention-line { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.mention-line .agent-chip { font-size: 11px; }
+.mention-line .alias-chip { font-size: 9.5px; margin-left: auto; }
+.mention-doing {
+  font-size: 10px;
+  color: var(--ink-ghost);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mention-on .mention-doing { color: var(--ink-faint); }
+.mention-row + .mention-head { margin-top: 3px; border-top: 1px solid var(--rule); padding-top: 7px; }
+
+/* Hover card: a small printed slip beside the chip. A tooltip, never a dialog. */
+.agent-card {
+  position: fixed;
+  z-index: 120;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px 9px;
+  background: var(--paper-raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  box-shadow: 0 14px 36px rgba(20, 18, 14, 0.14), 0 1px 3px rgba(20, 18, 14, 0.06);
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  user-select: none;
+}
+.agent-card-head { display: flex; align-items: center; gap: 7px; }
+.agent-card-head .agent-chip { font-size: 11.5px; }
+.agent-card-status { font-size: 10px; color: var(--ink-faint); }
+.agent-card-head .prov-dot { margin-left: auto; }
+.agent-card-title { color: var(--ink); font-weight: 500; line-height: 1.35; }
+.agent-card-doing {
+  font-size: 11px;
+  color: var(--ink-soft);
+  padding-left: 8px;
+  border-left: 2px solid var(--agent-rule);
+  line-height: 1.4;
+}
+.agent-card-sec { display: flex; flex-direction: column; gap: 2px; }
+.agent-card-sec .label { font-size: 8.5px; }
+.agent-card-done { text-transform: none; letter-spacing: 0; color: var(--ink-ghost); font-weight: 400; }
+.agent-card-prompt {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--ink-faint);
+  font-style: italic;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.agent-card-todos { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 1px; }
+.agent-card-todos li { display: flex; gap: 6px; font-size: 11px; line-height: 1.4; color: var(--ink-soft); }
+.todo-mark { color: var(--ink-ghost); flex: none; width: 10px; }
+.todo-in_progress .todo-mark { color: var(--agent); }
+.agent-card-todos .todo-in_progress { color: var(--ink); }
+.agent-card-todos .todo-more { color: var(--ink-ghost); padding-left: 16px; }
+.agent-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 9.5px;
+  color: var(--ink-ghost);
+  border-top: 1px solid var(--rule);
+  padding-top: 6px;
+  margin-top: 1px;
+  min-width: 0;
+}
+.agent-card-foot .alias-chip { font-size: 9.5px; }
+.agent-card-cwd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.agent-card-when { margin-left: auto; flex: none; }
+
+/* Inline callsign editor: @ + field, validation underneath. */
+.agent-edit { display: inline-flex; flex-direction: column; gap: 2px; min-width: 0; }
+.agent-edit-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 6px 0 5px;
+  border: 1px solid var(--agent-rule);
+  border-radius: 4px;
+  background: var(--agent-wash);
+  transition: border-color 120ms ease;
+  width: 150px;
+  max-width: 100%;
+}
+.agent-edit-box:focus-within { border-color: var(--agent); }
+.agent-edit-bad, .agent-edit-bad:focus-within { border-color: rgba(158, 59, 47, 0.55); }
+.agent-at { color: var(--agent); font-size: 11px; }
+.agent-edit-box input { flex: 1; min-width: 0; padding: 1px 0; font-size: 11px; color: var(--agent); }
+.agent-edit-spin { margin-left: 4px; border-top-color: var(--agent); }
+.agent-edit-msg { font-size: 9.5px; line-height: 1.35; color: var(--ink-ghost); overflow-wrap: anywhere; }
+.agent-edit-msg-bad { color: var(--danger); }
+.agent-sheet { display: flex; flex-direction: column; gap: 12px; }
+.agent-sheet .agent-edit-box { width: 100%; padding: 5px 10px 5px 9px; border-radius: var(--radius); }
+.agent-sheet .agent-at, .agent-sheet .agent-edit-box input { font-size: 13px; }
+.agent-sheet .agent-edit-msg { font-size: 10.5px; }
+.agent-sheet .sheet-note { line-height: 1.6; }
+.agent-sheet .sheet-note .agent-chip { display: inline; }
+
+/* Tree: the callsign leads each agent row; a pencil appears on hover. */
+.tree-agent-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tree-agent-name { display: inline-flex; flex: none; }
+.tree-agent-name .agent-chip { font-size: 10px; line-height: 1.45; }
+.tree-agent-meta .prov-dot { width: 4px; height: 4px; align-self: center; margin: 0; }
+.tree-agent-detached .agent-chip { background: transparent; box-shadow: inset 0 0 0 1px var(--agent-rule); }
+.tree-rename {
+  opacity: 0;
+  color: var(--ink-ghost);
+  flex: none;
+  margin-top: 2px;
+  padding: 2px 3px;
+  border-radius: 3px;
+  line-height: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+.tree-agent:hover .tree-rename, .tree-agent:focus-visible .tree-rename { opacity: 1; }
+.tree-rename:hover { color: var(--agent); background: var(--paper); }
+.tree-agent-editing { background: var(--paper-sunk); cursor: default; }
+.tree-agent-editing .tree-agent-meta { margin-top: 2px; }
+
+/* SESSION card: the name row. */
+.side-name { align-items: center; }
+.side-name-v { display: inline-flex; align-items: center; gap: 6px; }
+.side-rename { font-size: 9.5px; color: var(--ink-ghost); opacity: 0; transition: opacity 120ms ease; }
+.side-name:hover .side-rename { opacity: 1; }
+.side-rename:hover { color: var(--agent); }
+.side-name-edit { align-items: flex-start; }
+.side-name-edit .agent-edit { align-items: flex-end; }

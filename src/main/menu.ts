@@ -36,6 +36,7 @@ export function buildMenu(send: (command: string) => void): void {
         cmd('Switch Account…', 'Cmd+P', 'account.switch'),
         cmd('Move to Machine…', 'Cmd+Shift+P', 'session.moveMachine'),
         cmd('Rename Session…', 'Cmd+Shift+R', 'session.rename'),
+        cmd('Rename Agent…', 'Cmd+Alt+R', 'agent.rename'),
         cmd('Restart Session', 'Cmd+R', 'session.restart'),
         { type: 'separator' },
         cmd('Interrupt Agent', 'Cmd+.', 'session.interrupt'),

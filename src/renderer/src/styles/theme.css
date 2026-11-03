@@ -33,6 +33,11 @@
   --host:         #2a5fae;
   --host-wash:    #e1e9f5;
   --host-rule:    rgba(42, 95, 174, 0.28);
+  /* Agents: the violet beside that blue — same ink weight, same wash depth — so @euclid
+     and @g6e read as siblings, one a who and one a where. */
+  --agent:        #6a48a8;
+  --agent-wash:   #ebe5f5;
+  --agent-rule:   rgba(106, 72, 168, 0.28);
 
   --font-mono: 'SF Mono', 'JetBrains Mono', 'Berkeley Mono', ui-monospace, 'Menlo', monospace;
   --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
@@ -64,6 +69,9 @@
   --host:         #9cc3f3;
   --host-wash:    #1d2836;
   --host-rule:    rgba(156, 195, 243, 0.30);
+  --agent:        #c4b0f2;
+  --agent-wash:   #261f36;
+  --agent-rule:   rgba(196, 176, 242, 0.30);
   color-scheme: dark;
 }
 
