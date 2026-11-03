@@ -15,6 +15,8 @@ export interface Persisted {
   recentDirs: string[]
   /** Registered remote machines (the allowlist agents may use). */
   machines: Machine[]
+  /** Loopback port of the remote-agent gateway (gateway.ts); stable so tunnels and configs survive restarts. */
+  gatewayPort?: number
 }
 
 const EMPTY: Persisted = {

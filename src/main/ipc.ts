@@ -15,6 +15,7 @@ import {
   addMachine, inventory, listMachines, machineEvents, probeMachine, removeMachine, startInventory, suggestMachines,
   updateMachine, type MachineInput
 } from './machines'
+import { shutdownGateway, startGateway } from './gateway'
 import type { AgentProviderId, AppSnapshot, SpawnRequest, Tab } from '@shared/types'
 
 export const usageTracker = new UsageTracker(sessionManager)
@@ -46,8 +47,10 @@ export function wireEvents(): () => void {
   usageTracker.start()
   titles.start()
   const stopInventory = startInventory()
+  const detachGateway = startGateway()
   return () => {
     stopInventory()
+    detachGateway()
     machineEvents.off('update', onMachines)
     machineEvents.off('inventory', onInventory)
     usageTracker.stop()
@@ -223,6 +226,7 @@ export function registerIpc(): () => void {
 }
 
 export function shutdown(): void {
+  shutdownGateway()
   usageTracker.stop()
   titles.stop()
   sessionManager.disposeAll()

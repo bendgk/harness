@@ -66,6 +66,8 @@ export interface MachineInput {
   label?: string
   note?: string
   defaultCwd?: string
+  /** Let this machine's agents hand themselves back to the Mac via the gateway (default true). */
+  allowAgentHandoffToLocal?: boolean
 }
 
 /**
@@ -115,6 +117,7 @@ export async function addMachine(input: MachineInput): Promise<Machine> {
     label: cleanText(input.label, 60),
     note: cleanText(input.note, 300),
     defaultCwd: cleanCwd(input.defaultCwd),
+    ...(input.allowAgentHandoffToLocal === false ? { allowAgentHandoffToLocal: false } : {}),
     addedAt: Date.now(),
     probe: { at: 0, ok: false, target, tools: {} }
   }
@@ -132,8 +135,17 @@ export function updateMachine(alias: string, patch: Partial<Omit<MachineInput, '
     ...current,
     label: pick('label', (s) => cleanText(s, 60)),
     note: pick('note', (s) => cleanText(s, 300)),
-    defaultCwd: pick('defaultCwd', cleanCwd)
+    defaultCwd: pick('defaultCwd', cleanCwd),
+    allowAgentHandoffToLocal:
+      patch.allowAgentHandoffToLocal === undefined ? current.allowAgentHandoffToLocal : Boolean(patch.allowAgentHandoffToLocal)
   }
+  commit(listMachines().map((m) => (m.alias === alias ? next : m)))
+  return next
+}
+
+/** Internal bookkeeping fields other main-process modules own (gateway.ts: `remotePort`). Not for tools/IPC. */
+export function setMachineFields(alias: string, fields: Pick<Partial<Machine>, 'remotePort'>): Machine {
+  const next = { ...requireMachine(alias), ...fields }
   commit(listMachines().map((m) => (m.alias === alias ? next : m)))
   return next
 }

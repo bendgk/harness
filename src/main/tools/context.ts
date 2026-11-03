@@ -8,6 +8,7 @@ import { describeAccount, listAccounts } from '../accounts'
 import {
   addMachine, execOnMachine, inventory, listMachines, probeMachine, removeMachine, suggestMachines, updateMachine
 } from '../machines'
+import { gatewayStatus } from '../gateway'
 import { invokeTool } from './runtime'
 import type { ToolContext } from './types'
 
@@ -26,7 +27,8 @@ export function createToolContext(): ToolContext {
       probe: probeMachine,
       suggest: suggestMachines,
       exec: execOnMachine,
-      inventory
+      inventory,
+      gateway: gatewayStatus
     },
     getState,
     saveState,

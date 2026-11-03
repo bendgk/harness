@@ -78,7 +78,7 @@ const api = {
       invoke<{ alias: string; hostname?: string; user?: string; registered: boolean }[]>('machines:suggest'),
     add: (input: { alias: string; label?: string; note?: string; defaultCwd?: string }) =>
       invoke<Machine>('machines:add', input),
-    update: (alias: string, patch: { label?: string; note?: string; defaultCwd?: string }) =>
+    update: (alias: string, patch: { label?: string; note?: string; defaultCwd?: string; allowAgentHandoffToLocal?: boolean }) =>
       invoke<Machine>('machines:update', alias, patch),
     remove: (alias: string) => invoke<void>('machines:remove', alias),
     probe: (alias: string) => invoke<MachineProbe>('machines:probe', alias),

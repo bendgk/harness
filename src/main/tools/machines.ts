@@ -66,17 +66,27 @@ export const machineTools = [
   defineTool({
     name: 'machine_update',
     title: 'Update machine',
-    description: 'Change a registered machine\'s label, note or default working directory. Pass "" to clear a field.',
+    description:
+      'Change a registered machine\'s label, note, default working directory, or whether its agents may hand themselves back ' +
+      'to this Mac. Pass "" to clear a text field.',
     group: 'machines',
     input: {
       alias: ALIAS,
       label: z.string().optional().describe('Display label'),
       note: z.string().optional().describe('One line shown to agents'),
-      default_cwd: z.string().optional().describe('Default working directory on the machine (absolute or ~/...)')
+      default_cwd: z.string().optional().describe('Default working directory on the machine (absolute or ~/...)'),
+      allow_agent_handoff_to_local: z.boolean().optional().describe(
+        'Whether agents running on this machine may move themselves back to this Mac through the gateway (default true)'
+      )
     },
     mutates: true,
     handler: (args, ctx) => guarded(() => ({
-      json: ctx.machines.update(args.alias, { label: args.label, note: args.note, defaultCwd: args.default_cwd })
+      json: ctx.machines.update(args.alias, {
+        label: args.label,
+        note: args.note,
+        defaultCwd: args.default_cwd,
+        allowAgentHandoffToLocal: args.allow_agent_handoff_to_local
+      })
     }))
   }),
 
@@ -148,5 +158,16 @@ export const machineTools = [
       alias: z.string().optional().describe('Only this machine')
     },
     handler: (args, ctx) => guarded(async () => ({ json: await ctx.machines.inventory({ refresh: args.refresh, alias: args.alias }) }))
+  }),
+
+  defineTool({
+    name: 'gateway_status',
+    title: 'Gateway status',
+    description:
+      'The remote-agent gateway: the loopback port remote agents reach Paper on (through per-machine reverse ssh tunnels), each ' +
+      'tunnel\'s state (down/connecting/up/failed, with a classified error) and remote port, and how many session tokens are live.',
+    group: 'machines',
+    input: {},
+    handler: (_args, ctx) => ({ json: ctx.machines.gateway() })
   })
 ]

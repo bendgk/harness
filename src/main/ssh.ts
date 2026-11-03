@@ -19,6 +19,7 @@
  *   `~` escape disabled so typing "~." into an agent cannot drop the link.
  */
 import { spawn, execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createReadStream, lstatSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { PAPER_HOME } from './paths'
@@ -144,6 +145,77 @@ export function sshEnv(): Record<string, string> {
 /** argv (after the `ssh` binary) for an interactive pty: `ssh … -tt -- alias <command>`. */
 export function interactiveArgs(alias: string, command: string): string[] {
   return [...sessionOptions(), '-tt', '--', assertAlias(alias), command]
+}
+
+// ---- reverse tunnels (gateway.ts) ------------------------------------------------
+//
+// Each machine's tunnel is its own ControlMaster, a supervised foreground
+// `ssh -M -N` child of Paper, on a private control socket — separate from the
+// shared background master, whose ControlPersist lifetime Paper does not own.
+// The master carries ClearAllForwardings=yes like all background work, so no
+// forward from ~/.ssh/config ever rides along; the single gateway forward is
+// then added at runtime with `-O forward`, which ClearAllForwardings does not
+// touch (it only filters forwards parsed from config and argv at startup).
+//
+// The `-O` mux client runs with `-F /dev/null` and a literal ControlPath: it
+// only needs the socket, and without the user's config it cannot add their
+// LocalForward/RemoteForward lines to our master either. The forward always
+// names 127.0.0.1 on both ends; gateway.ts additionally verifies on the remote
+// that the listener is loopback-only (sshd `GatewayPorts yes` would override
+// the bind address) and cancels it otherwise.
+
+/** Control socket for an alias's tunnel master, or null when no private dir is available. */
+export function tunnelControlPath(alias: string): string | null {
+  const dir = controlDir()
+  if (!dir) return null
+  const id = createHash('sha256').update(assertAlias(alias)).digest('hex').slice(0, 24)
+  // ssh expands %-tokens in ControlPath; a literal % in PAPER_HOME must not be one.
+  return join(dir, `t-${id}`).split('%').join('%%')
+}
+
+function assertPort(p: number): number {
+  if (!Number.isInteger(p) || p < 1024 || p > 65535) throw new Error(`invalid port ${p}`)
+  return p
+}
+
+/** argv for the foreground tunnel master: authenticates once, forwards nothing until told to. */
+export function tunnelMasterArgs(alias: string, controlPath: string): string[] {
+  const o = [
+    ...COMMON,
+    'BatchMode=yes',
+    'ForwardAgent=no',
+    'ForwardX11=no',
+    'PermitLocalCommand=no',
+    'RequestTTY=no',
+    'ControlMaster=yes',
+    'ControlPersist=no',
+    `ControlPath=${controlPath}`
+  ]
+  return [...o.flatMap((x) => ['-o', x]), '-N', '--', assertAlias(alias)]
+}
+
+/** The `-R` spec: remote loopback port → local loopback port, never a wildcard bind. */
+export function reverseSpec(remotePort: number, localPort: number): string {
+  return `127.0.0.1:${assertPort(remotePort)}:127.0.0.1:${assertPort(localPort)}`
+}
+
+/** Talk to a tunnel master: `check`, `forward`/`cancel` (with a -R spec) or `exit`. */
+export function muxControl(
+  alias: string,
+  controlPath: string,
+  op: 'check' | 'forward' | 'cancel' | 'exit',
+  reverse?: string
+): Promise<{ code: number; stderr: string }> {
+  assertAlias(alias)
+  const args = ['-F', '/dev/null', '-o', `ControlPath=${controlPath}`, '-o', 'BatchMode=yes', '-O', op]
+  if (reverse) args.push('-R', reverse)
+  args.push('--', alias)
+  return new Promise((resolve) => {
+    execFile('ssh', args, { env: sshEnv(), timeout: 15_000 }, (err, _stdout, stderr) => {
+      const code = err ? (typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 255) : 0
+      resolve({ code, stderr: String(stderr) })
+    })
+  })
 }
 
 // ---- running commands ----------------------------------------------------------

@@ -20,6 +20,7 @@ import type { HandoffService } from '../handoff'
 import type { Persisted } from '../store'
 import type { Account, Machine, MachineInventory, MachineProbe } from '@shared/types'
 import type { ExecResult, MachineInput } from '../machines'
+import type { TunnelState } from '../gateway'
 
 export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state' | 'machines'
 
@@ -33,6 +34,8 @@ export interface MachineService {
   suggest(): Promise<{ alias: string; hostname?: string; user?: string; registered: boolean }[]>
   exec(alias: string, command: string, opts?: { cwd?: string; timeoutMs?: number; maxBytes?: number }): Promise<ExecResult>
   inventory(opts?: { refresh?: boolean; alias?: string }): Promise<MachineInventory[]>
+  /** The remote-agent gateway (gateway.ts): listener port, per-machine tunnels, live token count. */
+  gateway(): { port: number | null; tunnels: TunnelState[]; tokens: number }
 }
 
 export interface ToolResult {

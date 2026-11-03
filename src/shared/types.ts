@@ -125,6 +125,18 @@ export interface Machine {
   defaultCwd?: string
   addedAt: number
   probe?: MachineProbe
+  /**
+   * Loopback port on the machine where its reverse tunnel to Paper's gateway
+   * listens. Picked on first use and kept, so remote agents' MCP configs stay
+   * valid across Paper restarts. Managed by gateway.ts.
+   */
+  remotePort?: number
+  /**
+   * Whether agents running on this machine may hand themselves back to the
+   * Mac (session_handoff host "local") through the gateway. Default true.
+   * Off = a compromised remote cannot steer an agent into local privileges.
+   */
+  allowAgentHandoffToLocal?: boolean
 }
 
 export interface UsageSnapshot {

@@ -13,7 +13,20 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { kernel } from './kernel'
 import { TOOLS } from './tools'
 import { invokeTool } from './tools/runtime'
-import type { ToolResult } from './tools/types'
+import type { ToolDef, ToolResult } from './tools/types'
+
+/**
+ * Which tools a request may see and how calls are run. The local endpoint
+ * gets the whole registry; the remote gateway (gateway.ts) passes a filtered
+ * list and an invoke that enforces its per-token rules.
+ */
+export interface McpScope {
+  tools: ToolDef[]
+  invoke: (name: string, args: unknown) => Promise<ToolResult>
+  instructions?: string
+  /** Reject request bodies larger than this (bytes). */
+  maxBody?: number
+}
 
 const INSTRUCTIONS = `Paper is a terminal harness that runs Claude Code, Codex and shell sessions in panes.
 These tools inspect and drive the running app: list/read/type into sessions, read the renderer
@@ -31,9 +44,9 @@ function toContent(result: ToolResult): CallToolResult {
   return { content, isError: result.isError }
 }
 
-function buildServer(): McpServer {
-  const server = new McpServer({ name: 'paper', version: kernel().version }, { instructions: INSTRUCTIONS })
-  for (const tool of TOOLS) {
+function buildServer(scope: McpScope): McpServer {
+  const server = new McpServer({ name: 'paper', version: kernel().version }, { instructions: scope.instructions ?? INSTRUCTIONS })
+  for (const tool of scope.tools) {
     server.registerTool(
       tool.name,
       {
@@ -42,47 +55,57 @@ function buildServer(): McpServer {
         inputSchema: tool.input,
         annotations: { readOnlyHint: !tool.mutates, openWorldHint: false }
       },
-      async (args: unknown) => toContent(await invokeTool(tool.name, args))
+      async (args: unknown) => toContent(await scope.invoke(tool.name, args))
     )
   }
   return server
 }
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
+async function readBody(req: IncomingMessage, maxBody = Infinity): Promise<unknown> {
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let size = 0
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length
+    if (size > maxBody) throw new Error('request body too large')
+    chunks.push(chunk as Buffer)
+  }
   const text = Buffer.concat(chunks).toString('utf8')
   if (!text.trim()) return undefined
   return JSON.parse(text)
 }
 
-export function createMcpHandler(): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
-  return async (req, res) => {
-    if (req.method !== 'POST') {
-      // Stateless mode has no server-initiated stream to offer.
-      res.writeHead(405, { 'content-type': 'application/json', allow: 'POST' })
-      res.end(JSON.stringify({ error: 'POST JSON-RPC to this endpoint' }))
-      return
-    }
-    let body: unknown
-    try {
-      body = await readBody(req)
-    } catch (err) {
-      res.writeHead(400, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: `bad JSON: ${(err as Error).message}` }))
-      return
-    }
-    // Be lenient with hand-written clients (curl) that omit the SSE accept.
-    const accept = String(req.headers.accept || '')
-    if (!accept.includes('text/event-stream')) req.headers.accept = 'application/json, text/event-stream'
+const FULL_SCOPE: McpScope = { get tools() { return TOOLS }, invoke: invokeTool }
 
-    const server = buildServer()
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
-    res.on('close', () => {
-      void transport.close()
-      void server.close()
-    })
-    await server.connect(transport)
-    await transport.handleRequest(req, res, body)
+export function createMcpHandler(): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return (req, res) => handleMcpRequest(req, res, FULL_SCOPE)
+}
+
+/** Serve one stateless MCP request over `scope`. */
+export async function handleMcpRequest(req: IncomingMessage, res: ServerResponse, scope: McpScope): Promise<void> {
+  if (req.method !== 'POST') {
+    // Stateless mode has no server-initiated stream to offer.
+    res.writeHead(405, { 'content-type': 'application/json', allow: 'POST' })
+    res.end(JSON.stringify({ error: 'POST JSON-RPC to this endpoint' }))
+    return
   }
+  let body: unknown
+  try {
+    body = await readBody(req, scope.maxBody)
+  } catch (err) {
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: `bad JSON: ${(err as Error).message}` }))
+    return
+  }
+  // Be lenient with hand-written clients (curl) that omit the SSE accept.
+  const accept = String(req.headers.accept || '')
+  if (!accept.includes('text/event-stream')) req.headers.accept = 'application/json, text/event-stream'
+
+  const server = buildServer(scope)
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
+  res.on('close', () => {
+    void transport.close()
+    void server.close()
+  })
+  await server.connect(transport)
+  await transport.handleRequest(req, res, body)
 }
