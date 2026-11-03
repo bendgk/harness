@@ -18,9 +18,22 @@ import type { UsageTracker } from '../usage'
 import type { TitleService } from '../titles'
 import type { HandoffService } from '../handoff'
 import type { Persisted } from '../store'
-import type { Account } from '@shared/types'
+import type { Account, Machine, MachineInventory, MachineProbe } from '@shared/types'
+import type { ExecResult, MachineInput } from '../machines'
 
-export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state'
+export type ToolGroup = 'app' | 'sessions' | 'ui' | 'dev' | 'state' | 'machines'
+
+/** The machine registry (src/main/machines.ts) as tools see it. Every alias-taking call enforces the allowlist. */
+export interface MachineService {
+  list(): Machine[]
+  add(input: MachineInput): Promise<Machine>
+  update(alias: string, patch: Partial<Omit<MachineInput, 'alias'>>): Machine
+  remove(alias: string): Promise<void>
+  probe(alias: string, opts?: { maxAgeMs?: number }): Promise<MachineProbe>
+  suggest(): Promise<{ alias: string; hostname?: string; user?: string; registered: boolean }[]>
+  exec(alias: string, command: string, opts?: { cwd?: string; timeoutMs?: number; maxBytes?: number }): Promise<ExecResult>
+  inventory(opts?: { refresh?: boolean; alias?: string }): Promise<MachineInventory[]>
+}
 
 export interface ToolResult {
   /** Plain text for the caller. */
@@ -38,6 +51,7 @@ export interface ToolContext {
   usage: UsageTracker
   titles: TitleService
   handoff: HandoffService
+  machines: MachineService
   getState(): Persisted
   saveState(patch: Partial<Persisted>): void
   accounts(): Account[]

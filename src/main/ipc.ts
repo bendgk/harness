@@ -11,6 +11,10 @@ import {
 import { getState, loadState, saveState, flush, rememberDir } from './store'
 import { completeDir, dirInfo, prettyPath, resolvePath } from './fs'
 import { invokeTool, toolManifest } from './tools/runtime'
+import {
+  addMachine, inventory, listMachines, machineEvents, probeMachine, removeMachine, startInventory, suggestMachines,
+  updateMachine, type MachineInput
+} from './machines'
 import type { AgentProviderId, AppSnapshot, SpawnRequest, Tab } from '@shared/types'
 
 export const usageTracker = new UsageTracker(sessionManager)
@@ -32,12 +36,20 @@ export function wireEvents(): () => void {
   usageTracker.on('title', ({ sessionId, title }) => titles.adoptNative(sessionId, title))
   usageTracker.on('rebound', ({ sessionId, staleTitle }) => { if (staleTitle) titles.reset(sessionId) })
   handoff.on('progress', (p) => broadcast('handoff:progress', p))
+  const onMachines = (m: unknown): void => broadcast('machines:update', m)
+  const onInventory = (inv: unknown): void => broadcast('machines:inventory', inv)
+  machineEvents.on('update', onMachines)
+  machineEvents.on('inventory', onInventory)
 
   // Before the first tick, so a drifted session never reads the wrong file again.
   usageTracker.reconcile()
   usageTracker.start()
   titles.start()
+  const stopInventory = startInventory()
   return () => {
+    stopInventory()
+    machineEvents.off('update', onMachines)
+    machineEvents.off('inventory', onInventory)
     usageTracker.stop()
     titles.stop()
     usageTracker.removeAllListeners()
@@ -55,7 +67,7 @@ function snapshot(): AppSnapshot {
     defaults: state.defaults,
     widgets: state.widgets,
     recentDirs: state.recentDirs,
-    machines: state.machines ?? []
+    machines: listMachines()
   }
 }
 
@@ -190,6 +202,16 @@ export function registerIpc(): () => void {
     saveState({ defaults: { ...getState().defaults, cwd } })
     return handoff.retarget(sessionId, cwd)
   })
+
+  // ---- machines -----------------------------------------------------------
+  // machines:update is broadcast from machineEvents (wireEvents), so these just return.
+  handle('machines:list', () => listMachines())
+  handle('machines:suggest', () => suggestMachines())
+  handle('machines:add', (input: MachineInput) => addMachine(input))
+  handle('machines:update', (alias: string, patch: Partial<Omit<MachineInput, 'alias'>>) => updateMachine(alias, patch))
+  handle('machines:remove', (alias: string) => removeMachine(alias))
+  handle('machines:probe', (alias: string) => probeMachine(alias))
+  handle('machines:inventory', (refresh?: boolean) => inventory({ refresh: Boolean(refresh) }))
 
   // ---- tools: the same registry the MCP server exposes, for the UI ---------
   handle('tools:list', () => toolManifest())

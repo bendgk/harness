@@ -5,6 +5,9 @@ import { usageTracker, handoff, titles } from '../ipc'
 import { sendCommand } from '../menu'
 import { getState, saveState } from '../store'
 import { describeAccount, listAccounts } from '../accounts'
+import {
+  addMachine, execOnMachine, inventory, listMachines, probeMachine, removeMachine, suggestMachines, updateMachine
+} from '../machines'
 import { invokeTool } from './runtime'
 import type { ToolContext } from './types'
 
@@ -15,6 +18,16 @@ export function createToolContext(): ToolContext {
     usage: usageTracker,
     titles,
     handoff,
+    machines: {
+      list: listMachines,
+      add: addMachine,
+      update: updateMachine,
+      remove: removeMachine,
+      probe: probeMachine,
+      suggest: suggestMachines,
+      exec: execOnMachine,
+      inventory
+    },
     getState,
     saveState,
     accounts: () => listAccounts().map((a) => ({ ...a, plan: describeAccount(a) ?? a.plan })),

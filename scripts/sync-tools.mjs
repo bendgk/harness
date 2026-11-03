@@ -47,7 +47,8 @@ const GROUPS = {
   sessions: ['Sessions', 'The PTY sessions Paper runs: agents and shells.'],
   ui: ['Renderer', 'What is on screen, and driving it.'],
   dev: ['Hot reload & logs', 'Live code loading and diagnostics.'],
-  state: ['Persisted state', 'What survives a restart.']
+  state: ['Persisted state', 'What survives a restart.'],
+  machines: ['Machines', 'Remote computers (ssh host aliases) agents may work on or move to.']
 }
 
 function typeOf(prop) {

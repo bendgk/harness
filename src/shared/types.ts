@@ -104,6 +104,12 @@ export interface MachineProbe {
   codexHome?: string
   /** Version string (or path) per tool; absent means not installed. */
   tools: { claude?: string; codex?: string; tmux?: string }
+  /**
+   * Best-effort login state of each harness on the remote, from the presence
+   * of credential files / env vars (never their contents). 'unknown' when it
+   * cannot be told (e.g. macOS keychain) — only 'no' blocks a launch.
+   */
+  auth?: { claude?: 'yes' | 'no' | 'unknown'; codex?: 'yes' | 'no' | 'unknown' }
   latencyMs?: number
 }
 

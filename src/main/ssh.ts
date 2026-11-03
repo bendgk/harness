@@ -182,7 +182,15 @@ export function sshRaw(alias: string, command: string, opts: RunOptions = {}): P
     let err = ''
     let timedOut = false
     let overflow = false
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, opts.timeoutMs ?? 20_000)
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+      // A multiplexed client passes its stdio fds to the ControlMaster, which
+      // keeps them open until the remote command ends — so killing the client
+      // alone would not fire 'close'. Drop our ends to finish now.
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+    }, opts.timeoutMs ?? 20_000)
 
     child.stdout!.on('data', (b: Buffer) => {
       outLen += b.length

@@ -45,12 +45,16 @@ src/main/accounts.ts     Isolated CLI homes under ~/.paper/accounts/<id>; keycha
 src/main/handoff.ts      Account switch and directory retarget with the conversation intact.
 src/main/usage.ts        Transcript polling → UsageSnapshot (tracks in a kernel slot).
 src/main/titles.ts       Tab naming: native ai-title, one-shot model call, keyword fallback.
-src/main/store.ts        ~/.paper/state.json (tabs, defaults, widgets, recent dirs, accounts).
+src/main/store.ts        ~/.paper/state.json (tabs, defaults, widgets, recent dirs, accounts, machines).
+src/main/ssh.ts          The ONLY module that spawns ssh: alias validation, quoting, BatchMode/multiplexed options,
+                         upload/download, failure classification. See *Machines*.
+src/main/machines.ts     Machine registry (the allowlist), probe, ensureReady, ~/.ssh/config suggestions, the
+                         agent system-prompt text, machine_exec, and the tmux inventory poller.
 src/main/menu.ts         Application menu = the single source of shortcuts; sends `app:command` to the renderer.
 src/main/mcp.ts          MCP server (Streamable HTTP, stateless) over the tool registry.
-src/main/tools/          THE TOOL REGISTRY. types.ts (contract), app/sessions/ui/dev/state.ts (tools),
+src/main/tools/          THE TOOL REGISTRY. types.ts (contract), app/sessions/ui/dev/state/machines.ts (tools),
                          index.ts (list), runtime.ts (validate+invoke), context.ts (binds live services).
-src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage,handoff,tools,on*}.
+src/preload/index.ts     Typed bridge: window.paper.{session,accounts,dirs,usage,handoff,machines,tools,on*}.
 src/renderer/src/        React + zustand UI. state/store.ts is the app store (HMR-safe, exposed as
                          window.__paper); state/tree.ts is the pane-tree algebra; components/*, widgets/*.
 src/shared/              Types and pricing used by both sides.
@@ -115,11 +119,84 @@ Two cautions:
 - The same registry is on `window.paper.tools.{list,invoke}` for the renderer and on IPC `tools:list` /
   `tools:invoke`.
 
+## Machines
+
+A **machine** is a remote computer named by its ssh host alias from `~/.ssh/config` (e.g. `g6e`). Agents run on this
+Mac by default; with machines they can work on one over ssh, be launched on one, or be handed off to one and back.
+`src/main/machines.ts` is the registry; `src/main/ssh.ts` is the only code that spawns `ssh`.
+
+**Security model.** Paper is a thin layer over the user's own ssh setup and adds no trust of its own:
+- System `ssh` only, reading the user's `~/.ssh/config`, `known_hosts` and ssh-agent. Paper stores no keys,
+  passwords or host keys, runs no daemon on the remote, and uses only ssh, tmux and POSIX `sh` there.
+- Paper's background ssh (probe, inventory, transfers, `machine_exec`) is `BatchMode=yes`, `ForwardAgent=no`, no X11
+  or port forwards, multiplexed over one ControlMaster per host (`~/.paper/ssh/%C`, private dir, 120 s persist).
+- Aliases are validated (`[A-Za-z0-9_][A-Za-z0-9._-]*`, never `local`) and always follow `--` in argv; remote
+  commands are built with `shq` / `remotePath`, never by splicing unquoted input.
+- Problems are **surfaced, never fixed**: auth, host-key, DNS, timeout, missing CLI/tmux and not-logged-in come back
+  as a `MachineError { kind, message, hint, detail }` with an instruction for the human. Paper never runs
+  `ssh-add`, never accepts or edits host keys, never touches `~/.ssh`, never installs anything remotely. Auth
+  failures also say whether Paper's ssh-agent is empty or unreachable (`localAgentHint`).
+- **The allowlist is a Paper policy, not a sandbox.** `requireMachine(alias)` gates everything *Paper* does or
+  offers (launch, handoff, `machine_exec`, inventory, the machine list in agents' prompts). An agent has a shell and
+  can run `ssh` to anything the user's ssh can reach; the allowlist tells agents what they may use and keeps Paper
+  itself from touching other hosts. Do not describe it as more than that.
+- Text that reaches agents' system prompts — machine labels/notes (settable by agents through tools) and strings
+  the remote reports (OS, versions, paths, tmux titles) — is cut to one short printable line, so neither a note nor
+  a compromised remote can inject a paragraph into every agent's prompt. Probe flags report only whether a
+  credential file/env var *exists*, never its contents.
+
+**Registry** (`state.json` → `machines`, flushed immediately on change): `addMachine` validates the alias, rejects
+duplicates, resolves it with `ssh -G`, saves, then probes — it is registered even if the probe fails (the error is
+on `probe`). `removeMachine` also closes the ControlMaster (tmux sessions on the remote are left alone). Every change
+emits `machineEvents 'update'` → IPC `machines:update`.
+
+**Probe** (`probeMachine`, cached on `Machine.probe`, `maxAgeMs` reuse, concurrent probes of one alias share one run):
+one login-shell round trip (15 s cap) printing `key=value` lines between `MARK_BEGIN`/`MARK_END`: `uname -sr`,
+`$HOME`, `${CLAUDE_CONFIG_DIR:-~/.claude}`, `${CODEX_HOME:-~/.codex}`, and for claude/codex/tmux the path on the
+*login-shell* PATH plus `--version`/`-V` (each under `timeout 5` when available). Then a no-op over the warm
+connection measures `latencyMs`. ssh failures go through `classify`.
+
+**Login state** (`probe.auth`, best-effort, only `'no'` blocks): Claude is `yes` if `<claudeHome>/.credentials.json`
+exists (where Linux Claude Code keeps its token), or `.claude.json` has `oauthAccount`, or `settings.json` has an
+`apiKeyHelper`, or `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN`/Bedrock/Vertex is set in the
+login env; otherwise `no` on Linux and `unknown` elsewhere (macOS keeps it in the keychain). Codex is `yes` with
+`<codexHome>/auth.json` or `OPENAI_API_KEY`/`CODEX_API_KEY`, `unknown` if `config.toml` sets a
+`credentials_store`, else `no`. These check the remote's *default* CLI homes.
+
+**`ensureReady(alias, provider)`** — the launch/handoff gate: registered, probe ≤ 60 s old (a cached failure is
+re-probed once), provider CLI + tmux present (`missing-tool`, hint names what to install and that it must be on the
+login-shell PATH), not `not-logged-in`. Throws `MachineFailure` (`.info` is the MachineError).
+
+**Inventory** (`inventory()`, `startInventory()` from `wireEvents`): the remote is the source of truth for which
+agents exist. Per machine, one ssh reads `tmux -L paper list-sessions` (private socket; names `paper-*`; user
+options `@paper_id/@paper_provider/@paper_native/@paper_cwd/@paper_title`); "no server running" is an empty list.
+`attached` = a live local session has `host === alias && remote.tmux === name` and its link is not `lost`. Polls
+every 10 s while a Paper window is focused, 60 s otherwise, immediately on start, on window focus, on registry
+change, and on `machineEvents.emit('poke', alias)` — **poke after any remote launch/close/handoff**. Machines whose
+probe failed with `auth`/`host-key` are not polled (their error is still reported) until re-probed; an `auth`/`host-key`
+failure during a poll is written to the probe for the same reason. `inventory({ refresh: true })` re-probes those
+first. Results go out as `machineEvents 'inventory'` → IPC `machines:inventory`.
+
+**Agent context** (`machineContextPrompt({ sessionId, host })`, '' when there is nothing to say): a short block
+appended to agents' system prompts — where the agent runs, the registered machines (alias, user@hostname, OS, CLIs,
+default cwd, note, probe status), how to use them (`ssh <alias> -- '<cmd>'` non-interactively, `scp`/`rsync -az`,
+long jobs under `tmux new -d` / `nohup`), never to fix ssh or install anything, and to call `session_handoff` with
+`id = $PAPER_SESSION` and `host` when asked to move. It is in every prompt: keep it short.
+
+**IPC**: `machines:list|suggest|add|update|remove|probe|inventory` (preload `window.paper.machines.*`), events
+`machines:update` and `machines:inventory`. Tools: the *Machines* group below; `machine_exec` is how tests and
+other agents drive a remote through Paper.
+
+Testing machine code: `machines.ts` imports `electron` and `./sessions`; bundle scratch tests with esbuild, aliasing
+`electron` to a fake (`{ app: { getPath, on, off }, BrowserWindow: { getAllWindows: () => [] } }`) and `./sessions`
+to a stub with `list()`, and set `PAPER_HOME` to a scratch dir (it also isolates the ControlMaster, which matters
+when testing auth failures — a warm master would still authenticate).
+
 ## Tools
 
 <!-- tools:begin (generated by `npm run tools:sync`; do not edit by hand) -->
 
-31 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
+39 tools, served as `mcp__paper__<name>`. Read-only tools are marked; the rest change state.
 
 ### Instance
 
@@ -137,7 +214,7 @@ The manifest of every Paper tool with its JSON-schema input, including tools add
 
 | param | type | | description |
 |---|---|---|---|
-| `group` | "app" \| "sessions" \| "ui" \| "dev" \| "state" | optional | Only tools in this group |
+| `group` | "app" \| "sessions" \| "ui" \| "dev" \| "state" \| "machines" | optional | Only tools in this group |
 
 #### `tools_invoke`
 
@@ -408,6 +485,82 @@ Change the default provider, working directory, or pinned account per provider f
 Configured logins per provider: id, label, isolated config home, whether a credential is present, and the identity/plan if readable.
 
 _No parameters._
+
+### Machines
+
+Remote computers (ssh host aliases) agents may work on or move to.
+
+#### `machines_list` · read-only
+
+Registered remote machines (the allowlist agents may ssh into or be moved to): alias, label, note, default cwd, and the last probe — target user@hostname, OS, remote $HOME and CLI homes, installed claude/codex/tmux versions, best-effort login state, latency, or the classified error (kind + hint for the human).
+
+_No parameters._
+
+#### `machines_suggest` · read-only
+
+Host aliases found in ~/.ssh/config (and its Includes) that could be registered, with hostname/user from `ssh -G` and whether each is already registered. Wildcard and negated patterns are skipped; named aliases come before bare IPs.
+
+_No parameters._
+
+#### `machine_add`
+
+Register an ssh host alias as a Paper machine, then probe it. The alias must already work with the system ssh (~/.ssh/config, known_hosts, ssh-agent); Paper stores no keys. The machine is registered even if the probe fails — the error and its fix-it hint are on `probe`.
+
+| param | type | | description |
+|---|---|---|---|
+| `alias` | string | required | ssh host alias, e.g. "g6e" (letters, digits, ".", "_", "-"; not "local") |
+| `label` | string | optional | Display label |
+| `note` | string | optional | One line shown to agents, e.g. "8xL40S GPU box, repos in ~/work" |
+| `default_cwd` | string | optional | Default working directory on the machine (absolute or ~/...) |
+
+#### `machine_update`
+
+Change a registered machine's label, note or default working directory. Pass "" to clear a field.
+
+| param | type | | description |
+|---|---|---|---|
+| `alias` | string | required | Registered machine alias (its ~/.ssh/config Host name), e.g. "g6e" |
+| `label` | string | optional | Display label |
+| `note` | string | optional | One line shown to agents |
+| `default_cwd` | string | optional | Default working directory on the machine (absolute or ~/...) |
+
+#### `machine_remove`
+
+Unregister a machine and close Paper's shared ssh connection to it. Agents already running there in tmux are not killed.
+
+| param | type | | description |
+|---|---|---|---|
+| `alias` | string | required | Registered machine alias (its ~/.ssh/config Host name), e.g. "g6e" |
+
+#### `machine_probe`
+
+Check a registered machine over ssh (BatchMode, one round trip): reachability, OS, $HOME, CLI homes, claude/codex/tmux on the login-shell PATH with versions, login state, latency. Failures come back classified (auth, host-key, dns, unreachable, timeout) with a hint for the human — Paper never fixes ssh itself.
+
+| param | type | | description |
+|---|---|---|---|
+| `alias` | string | required | Registered machine alias (its ~/.ssh/config Host name), e.g. "g6e" |
+| `max_age_ms` | integer | default `0` | Reuse a cached probe younger than this; 0 = always ask the machine |
+
+#### `machine_exec`
+
+Run a shell command on a registered machine under its login shell (ssh BatchMode, no tty, no stdin) and return stdout, stderr and the exit code. Refuses unregistered aliases. Output past max_bytes keeps the tail. For long jobs start them detached (`tmux new -d -s name ...` or nohup) and poll.
+
+| param | type | | description |
+|---|---|---|---|
+| `alias` | string | required | Registered machine alias (its ~/.ssh/config Host name), e.g. "g6e" |
+| `command` | string | required | POSIX shell command, run as-is by the remote login shell |
+| `cwd` | string | optional | Directory to run in (absolute or ~/...) |
+| `timeout_ms` | integer | default `60000` | Kill the command after this long |
+| `max_bytes` | integer | default `100000` | Cap on returned stdout and stderr each |
+
+#### `machines_inventory` · read-only
+
+What is actually running on each registered machine, read from the machine itself: Paper's tmux sessions (`tmux -L paper`, names paper-*) with Paper session id, provider, conversation id, cwd, title, activity, and whether a local session is attached (unattached ones are adoptable). Polled in the background; `refresh` reads every machine now.
+
+| param | type | | description |
+|---|---|---|---|
+| `refresh` | boolean | default `false` | Ask the machines now instead of returning the last poll |
+| `alias` | string | optional | Only this machine |
 
 <!-- tools:end -->
 
