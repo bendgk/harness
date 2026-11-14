@@ -82,6 +82,13 @@ export default function App(): JSX.Element {
         case 'pane.prev': s.cyclePane(-1); break
         case 'tab.next': s.cycleTab(1); break
         case 'tab.prev': s.cycleTab(-1); break
+        case 'tab.moveLeft':
+        case 'tab.moveRight': {
+          const id = s.activeTabId
+          const i = s.tabs.findIndex((t) => t.id === id)
+          if (id && i >= 0) s.moveTab(id, i + (command === 'tab.moveLeft' ? -1 : 1))
+          break
+        }
         case 'sidebar.toggle': s.toggleSidebar(); break
         case 'widgets.toggle': s.setOverlay('widgets'); break
         case 'zen.toggle': s.toggleZen(); break

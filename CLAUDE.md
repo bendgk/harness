@@ -689,7 +689,7 @@ Recent console output from the renderer (errors, warnings, React messages). Newe
 
 #### `ui_command`
 
-Dispatch one of the application-menu commands exactly as its shortcut would (⌘K = palette.open, ⌘D = pane.split.row...). Known: session.new, session.new.claude, session.new.codex, session.new.shell, session.newInFolder, session.cd, session.close, session.restart, session.rename, session.interrupt, session.steer, session.find, session.clear, session.moveMachine, agent.rename, account.switch, accounts.open, machines.open, palette.open, pane.split.row, pane.split.col, pane.close, pane.contents, pane.next, pane.prev, tab.next, tab.prev, tab.select.0, sidebar.toggle, widgets.toggle, zen.toggle, font.bigger, font.smaller (tab.select.N for N in 0..8).
+Dispatch one of the application-menu commands exactly as its shortcut would (⌘K = palette.open, ⌘D = pane.split.row...). Known: session.new, session.new.claude, session.new.codex, session.new.shell, session.newInFolder, session.cd, session.close, session.restart, session.rename, session.interrupt, session.steer, session.find, session.clear, session.moveMachine, agent.rename, account.switch, accounts.open, machines.open, palette.open, pane.split.row, pane.split.col, pane.close, pane.contents, pane.next, pane.prev, tab.next, tab.prev, tab.moveLeft, tab.moveRight, tab.select.0, sidebar.toggle, widgets.toggle, zen.toggle, font.bigger, font.smaller (tab.select.N for N in 0..8).
 
 | param | type | | description |
 |---|---|---|---|
@@ -1273,6 +1273,18 @@ frames near real speed), which itself exercises the starved-renderer paths; take
 runs. `ProbeFrame.rows` is the text of the frame N shows (in scrollback, the rows at the rendered viewport, not
 `viewportY`, which `scrollLines` moves before xterm renders). Test transcripts that repeat themselves (many identical
 turns) are worth keeping: they exposed the shift aliasing above.
+
+## Tab strip reordering
+
+`components/TabBar.tsx` reorders tabs Chrome-style with pointer events (not HTML5 drag-and-drop, which can't
+animate neighbours or clamp to the strip). Press selects the tab immediately; past a 5 px slop it becomes a drag:
+layout is measured once (offsetLeft inside `.tabs`, which is `position: relative` so scrolling doesn't skew it),
+the held tab follows the pointer via `transform` (clamped to the strip), and neighbours slide by the held tab's
+width + gap once its leading edge crosses their midpoint. Nothing re-renders per move. An overflowing strip
+auto-scrolls when the pointer nears an edge. Release commits `store.moveTab(id, index)` (persisted) and FLIPs the
+held tab from where it was drawn into its slot; Escape or pointer cancel slides everything back. Keyboard /
+`ui_command`: `tab.moveLeft` / `tab.moveRight` (⌃⇧PgUp / ⌃⇧PgDn). Test by dispatching synthetic `PointerEvent`s
+on a `.tab` through `ui_eval` and reading `style.transform` mid-drag and `tabs` order after.
 
 ## Verifying a change — recipes
 

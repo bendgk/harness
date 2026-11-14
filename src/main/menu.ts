@@ -74,6 +74,8 @@ export function buildMenu(send: (command: string) => void): void {
       submenu: [
         cmd('Next Tab', 'Ctrl+Tab', 'tab.next'),
         cmd('Previous Tab', 'Ctrl+Shift+Tab', 'tab.prev'),
+        cmd('Move Tab Left', 'Ctrl+Shift+PageUp', 'tab.moveLeft'),
+        cmd('Move Tab Right', 'Ctrl+Shift+PageDown', 'tab.moveRight'),
         ...Array.from({ length: 9 }, (_, i) =>
           cmd(`Tab ${i + 1}`, `Cmd+${i + 1}`, `tab.select.${i}`)
         )

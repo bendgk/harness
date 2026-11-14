@@ -54,6 +54,7 @@
   -webkit-app-region: no-drag;
   overflow-x: auto;
   scrollbar-width: none;
+  position: relative;   /* offsetParent for the tabs, so drag measurements ignore scroll */
 }
 .tabs::-webkit-scrollbar { display: none; }
 
@@ -68,8 +69,22 @@
   cursor: default;
   position: relative;
   transition: color 120ms ease, background 120ms ease;
+  user-select: none;
+  touch-action: none;
 }
 .tab:hover { color: var(--ink-soft); }
+/* Dragging: the held tab lifts onto a card above its neighbours, which slide under it. */
+.tab-dragging {
+  z-index: 2;
+  color: var(--ink);
+  background: var(--paper-raised);
+  box-shadow: 0 0 0 1px var(--rule), 0 2px 8px rgba(0, 0, 0, 0.12);
+  border-radius: 6px 6px 0 0;
+}
+.tabs-dragging .tab { pointer-events: none; }
+.tabs-dragging .tab-dragging { pointer-events: auto; }
+.tabs-dragging .tab-close { opacity: 0 !important; }
+.tabs-dragging .tab-dragging .tab-close { opacity: 0.55 !important; }
 /* Flush: the active tab is marked by ink weight alone, not a rule or a card. */
 .tab-active { color: var(--ink); }
 .tab-active .tab-title { font-weight: 500; }

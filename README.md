@@ -160,6 +160,7 @@ per token, so it is a weight, not an invoice.
 | ⌘R | restart (keeps context) | ⌘⇧R | rename |
 | ⌘B | sidebar | ⌘⇧↩ | zen mode |
 | ⌘F | find | ⌘± | text size |
+| drag tab | reorder tabs (Esc cancels) | ⌃⇧PgUp / PgDn | move tab left / right |
 
 **⌘↩ (steer)** is the one worth knowing: it interrupts the agent mid-turn and
 submits a new instruction on the same conversation, so redirecting costs you

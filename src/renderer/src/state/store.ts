@@ -141,6 +141,8 @@ interface State {
   closeTab: (tabId: string) => void
   selectTab: (tabId: string) => void
   cycleTab: (delta: number) => void
+  /** Move a tab to index `to` (clamped) in the strip; the active tab is unchanged. */
+  moveTab: (tabId: string, to: number) => void
   setTabTitle: (tabId: string, title: string) => void
 
   focusPane: (paneId: string) => void
@@ -339,6 +341,19 @@ export const useStore = create<State>((set, get) => ({
     if (tabs.length < 2) return
     const i = tabs.findIndex((t) => t.id === activeTabId)
     set({ activeTabId: tabs[(i + delta + tabs.length) % tabs.length].id })
+  },
+
+  moveTab(tabId, to) {
+    const tabs = get().tabs
+    const from = tabs.findIndex((t) => t.id === tabId)
+    if (from < 0) return
+    const dest = Math.max(0, Math.min(tabs.length - 1, to))
+    if (dest === from) return
+    const next = tabs.slice()
+    const [tab] = next.splice(from, 1)
+    next.splice(dest, 0, tab)
+    set({ tabs: next })
+    persist()
   },
 
   setTabTitle(tabId, title) {
