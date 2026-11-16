@@ -11,7 +11,7 @@ const MENU_COMMANDS = [
   'machines.open',
   'palette.open',
   'pane.split.row', 'pane.split.col', 'pane.close', 'pane.contents', 'pane.next', 'pane.prev',
-  'tab.next', 'tab.prev', 'tab.moveLeft', 'tab.moveRight', 'tab.select.0', 'sidebar.toggle', 'widgets.toggle', 'zen.toggle',
+  'tab.new', 'tab.reopen', 'tab.next', 'tab.prev', 'tab.moveLeft', 'tab.moveRight', 'tab.select.0', 'sidebar.toggle', 'widgets.toggle', 'zen.toggle',
   'font.bigger', 'font.smaller'
 ]
 

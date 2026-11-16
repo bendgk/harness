@@ -16,6 +16,26 @@ export type Overlay =
   | null | 'palette' | 'accounts' | 'switch' | 'steer' | 'rename' | 'widgets' | 'panewidgets' | 'cwd'
   | 'machines' | 'move' | 'agentName'
 
+/**
+ * A closed tab, kept so ⌘⇧T can bring it back. Its pane tree is stored with
+ * every session detached (the sessions themselves ended on close); `spawns`
+ * says how to relaunch each terminal pane: agents resume their conversation,
+ * shells start fresh in the same directory, on the same host, same callsign.
+ */
+export interface ClosedTab {
+  title: string
+  titleOverride?: string
+  root: PaneNode
+  focusedPaneId: string
+  /** Where it sat in the strip, so it comes back to the same slot. */
+  index: number
+  spawns: Record<string, SpawnRequest>
+  closedAt: number
+}
+
+/** How many closed tabs ⌘⇧T can walk back through. */
+const CLOSED_TABS_MAX = 25
+
 interface HandoffState {
   sessionId: string
   stage: string
@@ -139,6 +159,10 @@ interface State {
   init: () => Promise<void>
   newTab: (req?: Partial<SpawnRequest>) => Promise<void>
   closeTab: (tabId: string) => void
+  /** Closed tabs, most recent last; ⌘⇧T pops from the end. In memory only. */
+  closedTabs: ClosedTab[]
+  /** Reopen the most recently closed tab, relaunching (resuming) its sessions. */
+  reopenClosedTab: () => Promise<void>
   selectTab: (tabId: string) => void
   cycleTab: (delta: number) => void
   /** Move a tab to index `to` (clamped) in the strip; the active tab is unchanged. */
@@ -220,9 +244,43 @@ function newTabObject(sessionId: string | null): Tab {
   return { id: uid(), title: 'New session', root, focusedPaneId: root.id, createdAt: Date.now() }
 }
 
+/** What it takes to bring a closed tab back; null when there is nothing worth reopening. */
+function snapshotClosedTab(tab: Tab, index: number, sessions: Record<string, SessionMeta>): ClosedTab | null {
+  const spawns: Record<string, SpawnRequest> = {}
+  let worthKeeping = false
+  const strip = (node: PaneNode): PaneNode => {
+    if (node.kind === 'split') return { ...node, children: node.children.map(strip) }
+    if (node.content.type !== 'terminal') { worthKeeping = true; return node }
+    const sid = leafSession(node)
+    const meta = sid ? sessions[sid] : undefined
+    if (!meta) return { ...node, content: { type: 'terminal', sessionId: null, cwd: node.content.cwd } }
+    worthKeeping = true
+    spawns[node.id] = {
+      provider: meta.provider,
+      accountId: meta.accountId,
+      cwd: meta.cwd,
+      host: meta.host,
+      resume: meta.provider !== 'shell' ? meta.nativeSessionId : undefined,
+      name: meta.name
+    }
+    return { kind: 'leaf', id: node.id, content: { type: 'terminal', sessionId: null, cwd: meta.cwd } }
+  }
+  const root = strip(tab.root)
+  // A tab that never ran anything (or held only empty panes) is not worth a slot.
+  if (!worthKeeping && leaves(tab.root).length === 1) return null
+  return { title: tab.title, titleOverride: tab.titleOverride, root, focusedPaneId: tab.focusedPaneId, index, spawns, closedAt: Date.now() }
+}
+
+/** The lone untouched tab Paper opens when the last one closes; ⌘⇧T replaces it rather than sitting beside it. */
+function isPristine(tab: Tab | undefined): boolean {
+  if (!tab || tab.root.kind !== 'leaf') return false
+  return tab.root.content.type === 'terminal' && !tab.root.content.sessionId && !tab.titleOverride
+}
+
 export const useStore = create<State>((set, get) => ({
   ready: false,
   tabs: [],
+  closedTabs: [],
   activeTabId: null,
   sessions: {},
   usage: {},
@@ -315,8 +373,12 @@ export const useStore = create<State>((set, get) => ({
   },
 
   closeTab(tabId) {
-    const tab = get().tabs.find((t) => t.id === tabId)
+    const index = get().tabs.findIndex((t) => t.id === tabId)
+    const tab = get().tabs[index]
     if (tab) {
+      // Snapshot before closing: the sessions' meta is gone once main reports them closed.
+      const closed = snapshotClosedTab(tab, index, get().sessions)
+      if (closed) set((s) => ({ closedTabs: [...s.closedTabs, closed].slice(-CLOSED_TABS_MAX) }))
       for (const l of leaves(tab.root)) {
         const sid = leafSession(l)
         if (sid) api.session.close(sid)
@@ -328,6 +390,43 @@ export const useStore = create<State>((set, get) => ({
       return { tabs, activeTabId }
     })
     if (!get().tabs.length) void get().newTab()
+    persist()
+  },
+
+  async reopenClosedTab() {
+    const closed = get().closedTabs.at(-1)
+    if (!closed) { get().notify('No recently closed tabs'); return }
+    set((s) => ({ closedTabs: s.closedTabs.slice(0, -1) }))
+    const tab: Tab = {
+      id: uid(),
+      title: closed.title,
+      titleOverride: closed.titleOverride,
+      root: closed.root,
+      focusedPaneId: closed.focusedPaneId,
+      createdAt: Date.now()
+    }
+    set((s) => {
+      // Closing the last tab left an empty placeholder; the reopened tab takes its place.
+      const only = s.tabs.length === 1 && isPristine(s.tabs[0])
+      const tabs = only ? [] : s.tabs.slice()
+      tabs.splice(Math.min(closed.index, tabs.length), 0, tab)
+      return { tabs, activeTabId: tab.id }
+    })
+    persist()
+    // Relaunch every pane at once, each straight into its own pane (not "the
+    // focused pane", which may change while the agents boot).
+    await Promise.all(Object.entries(closed.spawns).map(async ([paneId, req]) => {
+      try {
+        const meta = fakesOn() ? await fake.spawn(req) : await api.session.spawn(req)
+        set((s) => ({
+          sessions: { ...s.sessions, [meta.id]: meta },
+          tabs: s.tabs.map((t) => (t.id === tab.id ? { ...t, root: setPaneSession(t.root, paneId, meta.id) } : t))
+        }))
+      } catch (err) {
+        get().notify(cleanIpcError(err), 'warn', req.host && req.host !== LOCAL_HOST ? 9000 : undefined)
+      }
+    }))
+    syncTabTitles()
     persist()
   },
 

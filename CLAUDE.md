@@ -689,7 +689,7 @@ Recent console output from the renderer (errors, warnings, React messages). Newe
 
 #### `ui_command`
 
-Dispatch one of the application-menu commands exactly as its shortcut would (⌘K = palette.open, ⌘D = pane.split.row...). Known: session.new, session.new.claude, session.new.codex, session.new.shell, session.newInFolder, session.cd, session.close, session.restart, session.rename, session.interrupt, session.steer, session.find, session.clear, session.moveMachine, agent.rename, account.switch, accounts.open, machines.open, palette.open, pane.split.row, pane.split.col, pane.close, pane.contents, pane.next, pane.prev, tab.next, tab.prev, tab.moveLeft, tab.moveRight, tab.select.0, sidebar.toggle, widgets.toggle, zen.toggle, font.bigger, font.smaller (tab.select.N for N in 0..8).
+Dispatch one of the application-menu commands exactly as its shortcut would (⌘K = palette.open, ⌘D = pane.split.row...). Known: session.new, session.new.claude, session.new.codex, session.new.shell, session.newInFolder, session.cd, session.close, session.restart, session.rename, session.interrupt, session.steer, session.find, session.clear, session.moveMachine, agent.rename, account.switch, accounts.open, machines.open, palette.open, pane.split.row, pane.split.col, pane.close, pane.contents, pane.next, pane.prev, tab.new, tab.reopen, tab.next, tab.prev, tab.moveLeft, tab.moveRight, tab.select.0, sidebar.toggle, widgets.toggle, zen.toggle, font.bigger, font.smaller (tab.select.N for N in 0..8).
 
 | param | type | | description |
 |---|---|---|---|
@@ -1285,6 +1285,18 @@ auto-scrolls when the pointer nears an edge. Release commits `store.moveTab(id, 
 held tab from where it was drawn into its slot; Escape or pointer cancel slides everything back. Keyboard /
 `ui_command`: `tab.moveLeft` / `tab.moveRight` (⌃⇧PgUp / ⌃⇧PgDn). Test by dispatching synthetic `PointerEvent`s
 on a `.tab` through `ui_eval` and reading `style.transform` mid-drag and `tabs` order after.
+
+## New tab / reopen closed tab
+
+⌘T (`tab.new`) is the same as ⌘N: an empty tab with the harness chooser. ⌘⇧T (`tab.reopen`) walks back through
+closed tabs, most recently closed first, like a browser. `store.closeTab` snapshots the tab *before* ending its
+sessions (`snapshotClosedTab`: pane tree with sessions detached, plus a `SpawnRequest` per terminal pane taken
+from its `SessionMeta` — provider, account, cwd, host, callsign, and `resume: nativeSessionId` for agents) onto
+`closedTabs` (renderer store, in memory only, capped at 25, visible via `ui_state { path: 'closedTabs' }`). A tab
+that never ran anything isn't recorded. `store.reopenClosedTab()` pops the last entry, puts the tab back at its old
+index (replacing the lone empty placeholder left by closing the last tab), and spawns every pane in parallel
+straight into its own pane id — so agents resume their conversations and shells restart in the same directory.
+Test: open a shell tab, `ui_command session.close`, then `ui_command tab.reopen` and check `tabs` / `sessions`.
 
 ## Verifying a change — recipes
 

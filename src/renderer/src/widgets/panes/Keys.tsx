@@ -2,7 +2,7 @@ import type { PaneWidgetProps } from './types'
 
 const GROUPS: { title: string; keys: [string, string][] }[] = [
   { title: 'Sessions', keys: [
-    ['⌘N', 'new tab'], ['⌘⇧N', 'new in folder'], ['⌘X', 'kill pane'], ['⌘W', 'close tab'] ] },
+    ['⌘T', 'new tab'], ['⌘⇧T', 'reopen closed tab'], ['⌘⇧N', 'new in folder'], ['⌘X', 'kill pane'], ['⌘W', 'close tab'] ] },
   { title: 'Agent', keys: [
     ['⌘.', 'interrupt'], ['⌘↩', 'interrupt and steer'], ['⌘R', 'restart, keep context'], ['⌘P', 'switch account'] ] },
   { title: 'Layout', keys: [

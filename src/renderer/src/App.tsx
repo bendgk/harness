@@ -80,6 +80,8 @@ export default function App(): JSX.Element {
         case 'pane.contents': s.setOverlay('panewidgets'); break
         case 'pane.next': s.cyclePane(1); break
         case 'pane.prev': s.cyclePane(-1); break
+        case 'tab.new': void s.newTab(); break
+        case 'tab.reopen': void s.reopenClosedTab(); break
         case 'tab.next': s.cycleTab(1); break
         case 'tab.prev': s.cycleTab(-1); break
         case 'tab.moveLeft':

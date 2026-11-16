@@ -148,7 +148,8 @@ per token, so it is a weight, not an invoice.
 
 | | | | |
 |---|---|---|---|
-| ⌘N | new session | ⌘K | command palette |
+| ⌘T / ⌘N | new tab | ⌘K | command palette |
+| ⌘⇧T | reopen closed tab (resumes its agents) | ⌘W | close tab |
 | ⌘⇧N | new session in folder… | ⌘P | switch account |
 | ⌘⌥C / ⌘⌥X | new Claude / Codex session | ⌘, | accounts |
 | ⌘⌥T | new terminal | ⌘L | change directory… |

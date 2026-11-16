@@ -72,6 +72,9 @@ export function buildMenu(send: (command: string) => void): void {
     {
       label: 'Tabs',
       submenu: [
+        cmd('New Tab', 'Cmd+T', 'tab.new'),
+        cmd('Reopen Closed Tab', 'Cmd+Shift+T', 'tab.reopen'),
+        { type: 'separator' },
         cmd('Next Tab', 'Ctrl+Tab', 'tab.next'),
         cmd('Previous Tab', 'Ctrl+Shift+Tab', 'tab.prev'),
         cmd('Move Tab Left', 'Ctrl+Shift+PageUp', 'tab.moveLeft'),

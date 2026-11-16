@@ -273,7 +273,7 @@ export default function TabBar(): JSX.Element {
             </div>
           )
         })}
-        <button className="tab-new" title="New session (⌘N)" onClick={() => void newTab()}>+</button>
+        <button className="tab-new" title="New tab (⌘T)" onClick={() => void newTab()}>+</button>
       </div>
       <div className="tabbar-drag" />
     </div>
