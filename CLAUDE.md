@@ -1288,17 +1288,26 @@ on a `.tab` through `ui_eval` and reading `style.transform` mid-drag and `tabs` 
 
 ## Active tab outline
 
-The selected tab is outlined Chrome-style and the others stay flush (no separators). `TabOutline` in
-`components/TabBar.tsx` draws one thin `--rule-strong` stroke in an SVG measured to the tab (ResizeObserver, so the
-curves keep their radius at any width): from the bar's bottom rule it rises in a concave cubic flare, climbs the
-side, turns a convex cubic corner across the top (`OUTLINE_TOP` below the bar's top), and comes back down the same
-way. Constants: `CURVE` (8 px, both radii), `K` (0.55, control-point share). The shape is filled with `--paper`, which
-erases the rule under the tab so it opens onto the panes. Two layout facts make that work: the bar's bottom rule is
-a 1 px background gradient painted *inside* `.tabbar` (not a border: `.tabs` scrolls, so it clips anything drawn
-outside its own box), and `.tabs` pads its ends by `CURVE` so the first and last tabs' flares are not clipped.
-`.tab-active` takes `z-index: 1` with the SVG at `-1`, so the outline sits behind the tab's content and over its
-neighbours. Dragging the active tab lifts the outline with a drop shadow instead of the plain drag card. Check it
-with `ui_screenshot` (crop the tab strip at 2×) or `ui_eval` on `.tab-active .tab-outline`.
+The selected tab is outlined Chrome-style and the others stay flush (no separators). One SVG in `.tabs`
+(`components/TabBar.tsx`, first child, so the tabs paint over it) draws a thin `--rule-strong` stroke around the
+active tab's box in strip coordinates: from the bar's bottom rule it rises in a concave cubic flare, climbs the side,
+turns a convex cubic corner across the top (`OUTLINE_TOP` below the bar's top), and comes back down the same way
+(`outlinePaths`; `CURVE` 8 px for both radii, `K` 0.55 control-point share). The fill is `--paper`, which erases the
+rule under the tab so it opens onto the panes. The bar's bottom rule is a 1 px background gradient painted *inside*
+`.tabbar` (not a border: `.tabs` scrolls, so it clips anything drawn outside its own box), and `.tabs` pads its ends
+by `CURVE` so the first and last tabs' flares fit.
+
+**The glide.** Every outline has the same path commands, only the numbers differ, so the paths' CSS `d` property
+transitions between any two (`GLIDE`, 170 ms on the tab-slide curve): switching tabs slides and stretches the outline
+to the new tab with the curves keeping their radius. A layout effect re-measures after every render and a
+ResizeObserver on the strip and every tab after any resize; both go through `drawOutline`, which (1) skips a box it
+already drew, because even an identical write with `transition: none` cancels a glide in flight and the tab bar
+re-renders on every session update, and (2) turns any re-measure during a glide (`glidingUntil`) into a retarget,
+never a snap (the new tab's title turning bold widens it mid-glide). Dragging: `layout()` draws the outline on the held
+tab each move (no transition), the SVG gets `tab-outline-lifted` (drop shadow) and rises above the sliding
+neighbours, and the drop glides it into the slot with the tab's own FLIP. Test with `ui_eval`: select a tab, sample
+`getComputedStyle(document.querySelector('.tab-outline-edge')).d` each animation frame (the `M x` moves on an
+ease-out and lands on `.tab-active` offsetLeft + 0.5 − `CURVE`); `ui_screenshot` at 2× for the shape.
 
 ## New tab / reopen closed tab
 

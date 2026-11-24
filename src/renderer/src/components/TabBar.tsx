@@ -41,56 +41,38 @@ const OUTLINE_TOP = 6
 /** How far along the tangent a corner's control points sit, as a share of CURVE (0.55 ~ a circle). */
 const K = 0.55
 
+/** The outline's glide between tabs: the same curve and pace as a tab sliding into its slot. */
+const GLIDE = 'd 170ms cubic-bezier(0.2, 0, 0, 1)'
+
 /**
  * The selected tab's outline, Chrome style: one thin stroke that rises out of the bar's bottom
  * rule in a concave flare, climbs the tab's side, turns a convex corner across the top and comes
- * back down the same way -- each side an S of two cubics. The shape is filled with the page, so
- * the rule is erased under the tab and the tab reads as open onto the panes below it.
+ * back down the same way -- each side an S of two cubics. The fill (the same edge closed along
+ * the bottom) is the page, so the rule is erased under the tab and it reads as open onto the panes.
  *
- * Drawn in an SVG sized to the tab (measured, so the curves keep their radius at any width) and
- * CURVE wider on each side, which is where the flares sit; `.tabs` pads its ends to leave room.
+ * ONE outline serves the whole strip (an SVG under the tabs, in the strip's scroll coordinates),
+ * for a tab whose box is (x, w, h) there. Every outline has the same commands in the same order,
+ * only the numbers move, so the browser interpolates `d` between any two of them: switching tabs
+ * slides and stretches the outline from one to the other while the curves keep their radius.
  */
-function TabOutline(): JSX.Element {
-  const ref = useRef<SVGSVGElement>(null)
-  const [size, setSize] = useState<{ w: number; h: number } | null>(null)
-  useLayoutEffect(() => {
-    const host = ref.current?.parentElement
-    if (!host) return
-    const measure = (): void => {
-      setSize((s) => (s && s.w === host.offsetWidth && s.h === host.offsetHeight ? s : { w: host.offsetWidth, h: host.offsetHeight }))
-    }
-    measure()
-    const ro = new ResizeObserver(measure)
-    ro.observe(host)
-    return () => ro.disconnect()
-  }, [])
-  let edge = ''
-  let fill = ''
-  if (size) {
-    const r = CURVE
-    const x0 = r + 0.5              // the tab's left side, on a pixel centre so a 1px stroke stays crisp
-    const x1 = r + size.w - 0.5     // its right side
-    const top = OUTLINE_TOP + 0.5
-    const base = size.h - 0.5       // the bar's bottom rule
-    const c = r * K
-    edge = [
-      `M 0 ${base}`,
-      `C ${c} ${base} ${x0} ${base - r + c} ${x0} ${base - r}`,          // left flare (concave)
-      `L ${x0} ${top + r}`,
-      `C ${x0} ${top + r - c} ${x0 + r - c} ${top} ${x0 + r} ${top}`,      // top-left corner (convex)
-      `L ${x1 - r} ${top}`,
-      `C ${x1 - r + c} ${top} ${x1} ${top + r - c} ${x1} ${top + r}`,      // top-right corner
-      `L ${x1} ${base - r}`,
-      `C ${x1} ${base - r + c} ${x1 + r - c} ${base} ${x1 + r} ${base}`    // right flare
-    ].join(' ')
-    fill = `${edge} L ${x1 + r} ${size.h} L 0 ${size.h} Z`
-  }
-  return (
-    <svg ref={ref} className="tab-outline" width={size ? size.w + 2 * CURVE : 0} height={size?.h ?? 0} aria-hidden>
-      {size && <path className="tab-outline-fill" d={fill} />}
-      {size && <path className="tab-outline-edge" d={edge} />}
-    </svg>
-  )
+function outlinePaths(x: number, w: number, h: number): { edge: string; fill: string } {
+  const r = CURVE
+  const c = r * K
+  const x0 = x + 0.5              // the tab's left side, on a pixel centre so a 1px stroke stays crisp
+  const x1 = x + w - 0.5          // its right side
+  const top = OUTLINE_TOP + 0.5
+  const base = h - 0.5            // the bar's bottom rule
+  const edge = [
+    `M ${x0 - r} ${base}`,
+    `C ${x0 - r + c} ${base} ${x0} ${base - r + c} ${x0} ${base - r}`,    // left flare (concave)
+    `L ${x0} ${top + r}`,
+    `C ${x0} ${top + r - c} ${x0 + r - c} ${top} ${x0 + r} ${top}`,      // top-left corner (convex)
+    `L ${x1 - r} ${top}`,
+    `C ${x1 - r + c} ${top} ${x1} ${top + r - c} ${x1} ${top + r}`,      // top-right corner
+    `L ${x1} ${base - r}`,
+    `C ${x1} ${base - r + c} ${x1 + r - c} ${base} ${x1 + r} ${base}`    // right flare
+  ].join(' ')
+  return { edge, fill: `${edge} L ${x1 + r} ${h} L ${x0 - r} ${h} Z` }
 }
 
 /** The top rule: traffic-light inset, tabs, then a single new-session affordance. */
@@ -110,6 +92,53 @@ export default function TabBar(): JSX.Element {
   /** After a drop: where the dragged tab was drawn, so it can glide from there into its slot. */
   const settle = useRef<{ id: string; left: number } | null>(null)
   const [draggingId, setDraggingId] = useState<string | null>(null)
+  const outlineRef = useRef<SVGSVGElement>(null)
+  /** What the outline was last drawn for, so it can tell a tab switch (glide) from a resize (snap). */
+  const outlineFor = useRef<{ id: string | null; moved: boolean }>({ id: null, moved: false })
+  /** Until when the outline is gliding: a resize meanwhile (the new tab's title turning bold
+   *  widens it) retargets the glide instead of snapping, which would cut it off in its first frame. */
+  const glidingUntil = useRef(0)
+  /** The box the outline was last drawn for: redrawing the same one is skipped, since even an
+   *  identical write with `transition: none` would cancel a glide in flight (the tab bar re-renders
+   *  on every session update). */
+  const outlineBox = useRef('')
+
+  /** Draw the outline around the tab box (x, w, h) in strip coordinates; `glide` animates from wherever it is now. */
+  const drawOutline = useCallback((x: number, w: number, h: number, glide: boolean): void => {
+    const svg = outlineRef.current
+    const strip = stripRef.current
+    if (!svg || !strip) return
+    const box = `${x} ${w} ${h}`
+    if (box === outlineBox.current && svg.style.visibility === 'visible') return
+    outlineBox.current = box
+    // re-measured while gliding (a re-render, the new tab's title turning bold): retarget, never snap
+    glide = glide || performance.now() < glidingUntil.current
+    svg.setAttribute('width', String(Math.max(strip.scrollWidth, x + w + CURVE)))
+    svg.setAttribute('height', String(h))
+    const { edge, fill } = outlinePaths(x, w, h)
+    for (const [sel, d] of [['.tab-outline-edge', edge], ['.tab-outline-fill', fill]] as const) {
+      const path = svg.querySelector<SVGPathElement>(sel)
+      if (!path) continue
+      // transition and `d` change in one style write: the new transition governs this change
+      path.style.transition = glide ? GLIDE : 'none'
+      path.style.setProperty('d', `path('${d}')`)
+    }
+    if (glide) glidingUntil.current = performance.now() + 170   // a retarget runs a fresh 170 ms from here
+    svg.style.visibility = 'visible'
+  }, [])
+
+  /** Put the outline on the active tab: glide on a switch or after a drag, snap on a resize. */
+  const syncOutline = useCallback((glide: boolean): void => {
+    const id = useStore.getState().activeTabId
+    const el = id ? els.current.get(id) : undefined
+    if (!el) {
+      if (outlineRef.current) outlineRef.current.style.visibility = 'hidden'
+      outlineFor.current = { id: null, moved: false }
+      return
+    }
+    drawOutline(el.offsetLeft, el.offsetWidth, el.offsetHeight, glide)
+    outlineFor.current = { id: id ?? null, moved: false }
+  }, [drawOutline])
 
   /** Lay out every tab for the drag's current pointer position. */
   const layout = useCallback((d: Drag): void => {
@@ -131,6 +160,11 @@ export default function TabBar(): JSX.Element {
     if (target === i) for (let j = i - 1; j >= 0 && left < d.lefts[j] + d.widths[j] / 2; j--) target = j
     d.target = target
 
+    // the held tab is the active one (a press selects it): its outline rides along
+    const held = els.current.get(d.id)
+    drawOutline(d.lefts[i] + d.offset, d.widths[i], held ? held.offsetHeight : 0, false)
+    outlineFor.current.moved = true
+
     const step = d.widths[i] + d.gap
     d.ids.forEach((id, j) => {
       const el = els.current.get(id)
@@ -139,7 +173,7 @@ export default function TabBar(): JSX.Element {
       const shift = j > i && j <= target ? -step : j < i && j >= target ? step : 0
       el.style.transform = shift ? `translateX(${shift}px)` : ''
     })
-  }, [])
+  }, [drawOutline])
 
   /** While dragging near an edge of an overflowing strip, keep scrolling it. */
   const autoscroll = useCallback((): void => {
@@ -174,6 +208,7 @@ export default function TabBar(): JSX.Element {
       el.style.transform = ''
     }
     settle.current = { id: d.id, left: d.lefts[d.index] + d.offset }
+    outlineRef.current?.classList.remove('tab-outline-lifted')
     setDraggingId(null)
     if (moved) moveTab(d.id, d.target)
   }, [moveTab])
@@ -198,6 +233,24 @@ export default function TabBar(): JSX.Element {
       for (const x of els.current.values()) x.style.transition = ''
     }, 200)
   })
+
+  // The outline follows the active tab after every render: a switch (or the end of a drag, which
+  // glides it into the tab's slot with the tab's own FLIP) animates; anything else re-measures.
+  useLayoutEffect(() => {
+    if (draggingId) return
+    const was = outlineFor.current
+    syncOutline(was.id !== null && (was.id !== activeTabId || was.moved))
+  })
+  // ...and on any resize of the strip or a tab (a retitled neighbour, a window resize): snap.
+  const resizeObs = useRef<ResizeObserver | null>(null)
+  useLayoutEffect(() => {
+    const ro = resizeObs.current ?? (resizeObs.current = new ResizeObserver(() => {
+      if (!drag.current) syncOutline(false)
+    }))
+    if (stripRef.current) ro.observe(stripRef.current)
+    for (const el of els.current.values()) ro.observe(el)
+  })
+  useEffect(() => () => resizeObs.current?.disconnect(), [])
 
   // Escape cancels a drag; the tabs slide back to where they started.
   useEffect(() => {
@@ -249,6 +302,7 @@ export default function TabBar(): JSX.Element {
       if (Math.abs(e.clientX - d.startX) < DRAG_SLOP) return
       d.started = true
       setDraggingId(d.id)
+      outlineRef.current?.classList.add('tab-outline-lifted')
       for (const id of d.ids) {
         const el = els.current.get(id)
         if (el) el.style.transition = id === d.id ? 'none' : SLIDE
@@ -290,6 +344,10 @@ export default function TabBar(): JSX.Element {
     <div className="tabbar">
       <div className="tabbar-inset" />
       <div ref={stripRef} className={`tabs ${draggingId ? 'tabs-dragging' : ''}`}>
+        <svg ref={outlineRef} className="tab-outline" aria-hidden>
+          <path className="tab-outline-fill" />
+          <path className="tab-outline-edge" />
+        </svg>
         {tabs.map((tab) => {
           const active = tab.id === activeTabId
           const meta = focusedMeta(tab)
@@ -311,7 +369,6 @@ export default function TabBar(): JSX.Element {
               onDoubleClick={() => { selectTab(tab.id); setOverlay('rename') }}
               title={`${agentName ? `@${agentName} · ` : ''}${tab.title}${remote ? ` · on @${remote.host}` : ''}${paneCount > 1 ? ` · ${paneCount} panes` : ''}`}
             >
-              {active && <TabOutline />}
               <span className={`dot dot-${statusOf(tab)}`} />
               {provider && <span className={`prov-dot prov-${provider}`} />}
               {agentName && <span className="agent-chip tab-agent mono">@{agentName}</span>}

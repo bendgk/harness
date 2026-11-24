@@ -88,22 +88,25 @@
 .tabs-dragging .tab-dragging { pointer-events: auto; }
 .tabs-dragging .tab-close { opacity: 0 !important; }
 .tabs-dragging .tab-dragging .tab-close { opacity: 0.55 !important; }
-/* The active tab: a thin Chrome-style outline (TabOutline) open onto the panes; the others stay
-   flush, with no separators. The outline paints behind the tab's content and above its neighbours. */
-.tab-active { color: var(--ink); z-index: 1; }
+/* The active tab: a thin Chrome-style outline open onto the panes (one SVG for the strip, drawn
+   by TabBar.tsx, that glides from tab to tab); the others stay flush, with no separators. It sits
+   first in the strip, so the tabs paint over it: behind every tab's content, over the bar's rule. */
+.tab-active { color: var(--ink); }
 .tab-outline {
   position: absolute;
-  left: -8px;           /* CURVE: the flares reach past the tab's own box */
+  left: 0;
   top: 0;
-  z-index: -1;
   pointer-events: none;
   overflow: visible;
+  visibility: hidden;   /* until the first measure */
 }
 .tab-outline-fill { fill: var(--paper); }
 .tab-outline-edge { fill: none; stroke: var(--rule-strong); stroke-width: 1; stroke-linejoin: round; }
 /* Dragging the active tab: the outline lifts with it instead of the plain card. */
 .tab-dragging.tab-active { background: none; box-shadow: none; }
-.tab-dragging .tab-outline { filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.14)); }
+.tab-outline-lifted { filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.14)); }
+/* ...and rides above the neighbours sliding under the held tab (which is z-index 2). */
+.tabs-dragging .tab-outline { z-index: 1; }
 .tab-active .tab-title { font-weight: 500; }
 .tab-title {
   font-size: 12px;
