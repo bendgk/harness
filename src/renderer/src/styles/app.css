@@ -39,8 +39,10 @@
   height: var(--chrome-h);
   display: flex;
   align-items: stretch;
-  background: var(--paper);
-  border-bottom: 1px solid var(--rule);
+  /* The bottom rule is painted INSIDE the bar (its last pixel row), not as a border: the active
+     tab's outline fills over it to open onto the panes, and `.tabs` scrolls, so it clips anything
+     drawn outside its own box. */
+  background: linear-gradient(var(--rule), var(--rule)) bottom / 100% 1px no-repeat, var(--paper);
   -webkit-app-region: drag;
   flex: none;
 }
@@ -55,6 +57,7 @@
   overflow-x: auto;
   scrollbar-width: none;
   position: relative;   /* offsetParent for the tabs, so drag measurements ignore scroll */
+  padding: 0 8px;       /* room for the active tab's flares (CURVE in TabBar.tsx) at either end */
 }
 .tabs::-webkit-scrollbar { display: none; }
 
@@ -62,7 +65,7 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 0 11px;
+  padding: 6px 11px 0;   /* the top matches OUTLINE_TOP, so titles centre inside the outline */
   max-width: 230px;
   min-width: 96px;
   color: var(--ink-faint);
@@ -85,8 +88,22 @@
 .tabs-dragging .tab-dragging { pointer-events: auto; }
 .tabs-dragging .tab-close { opacity: 0 !important; }
 .tabs-dragging .tab-dragging .tab-close { opacity: 0.55 !important; }
-/* Flush: the active tab is marked by ink weight alone, not a rule or a card. */
-.tab-active { color: var(--ink); }
+/* The active tab: a thin Chrome-style outline (TabOutline) open onto the panes; the others stay
+   flush, with no separators. The outline paints behind the tab's content and above its neighbours. */
+.tab-active { color: var(--ink); z-index: 1; }
+.tab-outline {
+  position: absolute;
+  left: -8px;           /* CURVE: the flares reach past the tab's own box */
+  top: 0;
+  z-index: -1;
+  pointer-events: none;
+  overflow: visible;
+}
+.tab-outline-fill { fill: var(--paper); }
+.tab-outline-edge { fill: none; stroke: var(--rule-strong); stroke-width: 1; stroke-linejoin: round; }
+/* Dragging the active tab: the outline lifts with it instead of the plain card. */
+.tab-dragging.tab-active { background: none; box-shadow: none; }
+.tab-dragging .tab-outline { filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.14)); }
 .tab-active .tab-title { font-weight: 500; }
 .tab-title {
   font-size: 12px;

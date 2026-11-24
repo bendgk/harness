@@ -34,6 +34,65 @@ type Drag = {
   raf: number
 }
 
+/** Radius of the active tab's shoulders: the convex top corners and the concave flares at its foot. */
+const CURVE = 8
+/** Where the active tab's outline starts below the top of the bar. */
+const OUTLINE_TOP = 6
+/** How far along the tangent a corner's control points sit, as a share of CURVE (0.55 ~ a circle). */
+const K = 0.55
+
+/**
+ * The selected tab's outline, Chrome style: one thin stroke that rises out of the bar's bottom
+ * rule in a concave flare, climbs the tab's side, turns a convex corner across the top and comes
+ * back down the same way -- each side an S of two cubics. The shape is filled with the page, so
+ * the rule is erased under the tab and the tab reads as open onto the panes below it.
+ *
+ * Drawn in an SVG sized to the tab (measured, so the curves keep their radius at any width) and
+ * CURVE wider on each side, which is where the flares sit; `.tabs` pads its ends to leave room.
+ */
+function TabOutline(): JSX.Element {
+  const ref = useRef<SVGSVGElement>(null)
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null)
+  useLayoutEffect(() => {
+    const host = ref.current?.parentElement
+    if (!host) return
+    const measure = (): void => {
+      setSize((s) => (s && s.w === host.offsetWidth && s.h === host.offsetHeight ? s : { w: host.offsetWidth, h: host.offsetHeight }))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(host)
+    return () => ro.disconnect()
+  }, [])
+  let edge = ''
+  let fill = ''
+  if (size) {
+    const r = CURVE
+    const x0 = r + 0.5              // the tab's left side, on a pixel centre so a 1px stroke stays crisp
+    const x1 = r + size.w - 0.5     // its right side
+    const top = OUTLINE_TOP + 0.5
+    const base = size.h - 0.5       // the bar's bottom rule
+    const c = r * K
+    edge = [
+      `M 0 ${base}`,
+      `C ${c} ${base} ${x0} ${base - r + c} ${x0} ${base - r}`,          // left flare (concave)
+      `L ${x0} ${top + r}`,
+      `C ${x0} ${top + r - c} ${x0 + r - c} ${top} ${x0 + r} ${top}`,      // top-left corner (convex)
+      `L ${x1 - r} ${top}`,
+      `C ${x1 - r + c} ${top} ${x1} ${top + r - c} ${x1} ${top + r}`,      // top-right corner
+      `L ${x1} ${base - r}`,
+      `C ${x1} ${base - r + c} ${x1 + r - c} ${base} ${x1 + r} ${base}`    // right flare
+    ].join(' ')
+    fill = `${edge} L ${x1 + r} ${size.h} L 0 ${size.h} Z`
+  }
+  return (
+    <svg ref={ref} className="tab-outline" width={size ? size.w + 2 * CURVE : 0} height={size?.h ?? 0} aria-hidden>
+      {size && <path className="tab-outline-fill" d={fill} />}
+      {size && <path className="tab-outline-edge" d={edge} />}
+    </svg>
+  )
+}
+
 /** The top rule: traffic-light inset, tabs, then a single new-session affordance. */
 export default function TabBar(): JSX.Element {
   const tabs = useStore((s) => s.tabs)
@@ -252,6 +311,7 @@ export default function TabBar(): JSX.Element {
               onDoubleClick={() => { selectTab(tab.id); setOverlay('rename') }}
               title={`${agentName ? `@${agentName} · ` : ''}${tab.title}${remote ? ` · on @${remote.host}` : ''}${paneCount > 1 ? ` · ${paneCount} panes` : ''}`}
             >
+              {active && <TabOutline />}
               <span className={`dot dot-${statusOf(tab)}`} />
               {provider && <span className={`prov-dot prov-${provider}`} />}
               {agentName && <span className="agent-chip tab-agent mono">@{agentName}</span>}

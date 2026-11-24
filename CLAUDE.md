@@ -1286,6 +1286,20 @@ held tab from where it was drawn into its slot; Escape or pointer cancel slides 
 `ui_command`: `tab.moveLeft` / `tab.moveRight` (⌃⇧PgUp / ⌃⇧PgDn). Test by dispatching synthetic `PointerEvent`s
 on a `.tab` through `ui_eval` and reading `style.transform` mid-drag and `tabs` order after.
 
+## Active tab outline
+
+The selected tab is outlined Chrome-style and the others stay flush (no separators). `TabOutline` in
+`components/TabBar.tsx` draws one thin `--rule-strong` stroke in an SVG measured to the tab (ResizeObserver, so the
+curves keep their radius at any width): from the bar's bottom rule it rises in a concave cubic flare, climbs the
+side, turns a convex cubic corner across the top (`OUTLINE_TOP` below the bar's top), and comes back down the same
+way. Constants: `CURVE` (8 px, both radii), `K` (0.55, control-point share). The shape is filled with `--paper`, which
+erases the rule under the tab so it opens onto the panes. Two layout facts make that work: the bar's bottom rule is
+a 1 px background gradient painted *inside* `.tabbar` (not a border: `.tabs` scrolls, so it clips anything drawn
+outside its own box), and `.tabs` pads its ends by `CURVE` so the first and last tabs' flares are not clipped.
+`.tab-active` takes `z-index: 1` with the SVG at `-1`, so the outline sits behind the tab's content and over its
+neighbours. Dragging the active tab lifts the outline with a drop shadow instead of the plain drag card. Check it
+with `ui_screenshot` (crop the tab strip at 2×) or `ui_eval` on `.tab-active .tab-outline`.
+
 ## New tab / reopen closed tab
 
 ⌘T (`tab.new`) is the same as ⌘N: an empty tab with the harness chooser. ⌘⇧T (`tab.reopen`) walks back through
